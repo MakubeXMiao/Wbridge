@@ -1,0 +1,15 @@
+# 运行时数据与凭据：永不入库
+state/
+wechat-bridge/
+*.log
+*.pid
+session.json
+last_context.json
+get_updates_buf.txt
+inbox/
+outbox/
+media/
+hooks/state/
+__pycache__/
+*.egg-info/
+wechat-bridge-backups/
