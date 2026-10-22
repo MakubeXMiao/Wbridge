@@ -135,16 +135,20 @@ def t_fix1_recovery():
     write_job(store, "stuck.json", where="sending", attempts=2,
               next_attempt_at=time.time() + 9999,
               delivery_state="inflight")
-    # 旧行为：flush 根本不看 sending/，任务隐形
+    # Every serial flush now recovers abandoned sending files, but a committed
+    # retry schedule must not be erased by source-cleanup recovery.
     flush(store)
-    check("F1 回收前 flush 不动 sending（旧问题复现锚点）",
-          net.send_count() == 0 and ls(store.sending_dir) == ["stuck.json"])
+    check("F1 flush自动回收sending且保留退避",
+          net.send_count() == 0 and ls(store.sending_dir) == []
+          and ls(store.pending_dir) == ["stuck.json"])
     serve._recover_sending(store)
     check("F1 回收后任务回到 pending", ls(store.pending_dir) == ["stuck.json"]
           and ls(store.sending_dir) == [])
     j = load_json(os.path.join(store.pending_dir, "stuck.json"))
-    check("F1 回收保留 attempts、清退避",
-          j.get("attempts") == 2 and j.get("next_attempt_at") == 0, j)
+    check("F1 回收保留attempts和已持久退避",
+          j.get("attempts") == 2 and j.get("next_attempt_at") > time.time(), j)
+    j["next_attempt_at"] = 0
+    atomic_write_json(os.path.join(store.pending_dir, "stuck.json"), j)
     flush(store)
     check("F1 回收后任务正常发出", ls(store.sent_dir) == ["stuck.json"])
 
@@ -442,11 +446,20 @@ def t_fix8_binded_redirect_persists():
                       {"qrcode": "abc", "api": "https://api.invalid"})
     cli.http_json = lambda *a, **k: {
         "status": "binded_redirect", "bot_token": "tokXYZ",
-        "ilink_bot_id": "b2", "ilink_user_id": "u2"}
+        "ilink_bot_id": "b", "ilink_user_id": "u"}
     rc = cli.cmd_wait_login(argparse.Namespace())
     sess = load_json(store.session_path) or {}
-    check("F8 binded_redirect 落盘会话", rc == 0
+    check("F8 binded_redirect 同账号续期落盘", rc == 0
           and sess.get("bot_token") == "tokXYZ", (rc, sess))
+    atomic_write_json(store.qr_path,
+                      {"qrcode": "second", "api": "https://api.invalid"})
+    cli.http_json = lambda *a, **k: {
+        "status": "binded_redirect", "bot_token": "different-token",
+        "ilink_bot_id": "b2", "ilink_user_id": "u2"}
+    rc = cli.cmd_wait_login(argparse.Namespace())
+    check("F8 binded_redirect 换账号拒绝并保留原会话", rc == 1
+          and load_json(store.session_path) == sess,
+          (rc, load_json(store.session_path)))
 
 
 # ---------- 第 12 项：坏 pending 文件隔离 ----------
