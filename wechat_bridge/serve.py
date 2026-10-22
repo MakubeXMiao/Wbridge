@@ -12,6 +12,7 @@ iLink deduplication and Muse platform scheduling still require owner acceptance.
 """
 
 import fcntl
+import json
 import math
 import os
 import threading
@@ -493,6 +494,11 @@ def _split_caption(store, name, job):
         "enqueued_at": _job_enqueued_at(
             os.path.join(store.sending_dir, name), job),
     }
+    # Preserve observation times through caption splitting. Queue identity,
+    # coverage and delivery decisions remain unchanged.
+    for field in ("received_at", "worker_started_at"):
+        if field in job:
+            cap_job[field] = job[field]
     return job, cap_name, cap_job
 
 
@@ -509,6 +515,56 @@ def _is_mergeable_text(name, job):
     if int(job.get("chunks_done") or 0) != 0:
         return False
     return bool((job.get("text") or "").strip())
+
+
+def _trace_delivery(stage, name, job, started_at=None, chunks_done=None,
+                    chunks_total=None):
+    """Best-effort timing only; never serialize reply bodies or credentials.
+
+    ``api_accepted`` records an observed API acknowledgement, not phone receipt.
+    Text acknowledgements are per chunk; elapsed time spans this send attempt
+    (including any earlier chunks/pacing), not an individual HTTP round trip.
+    """
+    try:
+        at = time.time()
+        row = {"stage": stage, "at": at}
+        job_id = name[:-5] if isinstance(name, str) and name.endswith(".json") else name
+        try:
+            row["job_id"] = safe_message_id(job_id)
+        except (ValueError, TypeError):
+            pass
+        ids = job.get("covers_message_ids")
+        if not isinstance(ids, (list, tuple)) or not ids:
+            ids = [job.get("message_id")]
+        message_ids = []
+        for value in ids:
+            try:
+                mid = safe_message_id(value)
+            except (ValueError, TypeError):
+                continue
+            if mid not in message_ids:
+                message_ids.append(mid)
+        row["message_ids"] = message_ids
+        row["count"] = len(message_ids)
+        for field in ("received_at", "worker_started_at", "enqueued_at"):
+            value = job.get(field)
+            if (not isinstance(value, bool) and isinstance(value, (int, float))
+                    and math.isfinite(value) and value >= 0):
+                row[field] = value
+        for field in ("received_at", "worker_started_at", "enqueued_at"):
+            if field in row:
+                row["since_" + field[:-3] + "_ms"] = round(max(0, at - row[field]) * 1000, 3)
+        if (not isinstance(started_at, bool) and isinstance(started_at, (int, float))
+                and math.isfinite(started_at) and started_at >= 0):
+            row["send_started_at"] = started_at
+            row["attempt_elapsed_ms"] = round(max(0, at - started_at) * 1000, 3)
+        for field, value in (("chunks_done", chunks_done), ("chunks_total", chunks_total)):
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                row[field] = value
+        log("latency " + json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+    except Exception:
+        # Observability failures must not change delivery or retry decisions.
+        pass
 
 
 def _deliver_claimed(store, baseurl, token, counts, name, job,
@@ -582,6 +638,8 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
                 job["next_attempt_at"] = 0
                 _return_to_pending(store, sending_path, pending_path, job)
                 return True
+            send_started_at = time.time()
+            _trace_delivery("send_started", name, job, started_at=send_started_at)
             resp = send_media_message(
                 baseurl, token, to_user_id,
                 job.get("context_token") or "", media_path,
@@ -590,12 +648,16 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
                 heartbeat=lambda: _touch_flusher_heartbeat(store))
             sent_units = 1
             if resp_ok(resp):
+                _trace_delivery("api_accepted", name, job, started_at=send_started_at)
                 counts[tok_key] = counts.get(tok_key, 0) + 1
         else:
             start_chunk = int(job.get("chunks_done") or 0)
 
             def _persist_chunk_progress(done, total,
                                         _job=job, _path=sending_path):
+                _trace_delivery("api_accepted", name, _job,
+                                started_at=send_started_at,
+                                chunks_done=done, chunks_total=total)
                 # 每片送达立即落盘：进程被杀也不丢已达片数（审查第 3 项）
                 previous = int(_job.get("chunks_done") or 0)
                 _job["chunks_done"] = done
@@ -604,6 +666,9 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
                 # 顺手刷新心跳：长文本逐片发时 flusher 显然活着（P1-1）
                 _touch_flusher_heartbeat(store)
 
+            send_started_at = time.time()
+            if start_chunk < len(split_text(job.get("text") or "")):
+                _trace_delivery("send_started", name, job, started_at=send_started_at)
             resp = send_message(
                 baseurl, token, to_user_id, job.get("text") or "",
                 job.get("context_token") or "",

@@ -20,10 +20,13 @@ from .store import (Store, atomic_write_json, atomic_write_text, load_json,
                     message_receipt_lock, safe_message_id)
 
 FIRST_STALE = 180
-REWAKE_INTERVAL = 600
 STARTED_STALE = 700
-CLAIM_STALE = 21600
 REWAKE_MAX = 3
+# The 180s window is for an event that has not started. A running worker must
+# make real progress and renew; a detached timer must never keep it alive.
+WORKER_LEASE_SECONDS = 90
+RENEW_EVERY_SECONDS = 30
+WORKER_MAX_SECONDS = 570  # release before the platform's 600s turn limit
 
 
 @contextmanager
@@ -87,12 +90,104 @@ class WorkerState:
                 continue
             claims[mid] = {"first": first, "last": last,
                            "lease": fields[3] if len(fields) > 3 else "legacy"}
+            if len(fields) >= 6 and fields[4] in ("event", "worker"):
+                try:
+                    claims[mid].update(kind=fields[4], started_at=int(fields[5]))
+                except ValueError:
+                    claims.pop(mid, None)
         return claims
 
     def _write_claims(self, claims):
         atomic_write_text(str(self.claim_path), "".join(
-            "%s %d %d %s\n" % (mid, row["first"], row["last"], row["lease"])
+            "%s %d %d %s%s\n" % (mid, row["first"], row["last"], row["lease"],
+                " %s %d" % (row["kind"], row["started_at"]) if "kind" in row else "")
             for mid, row in sorted(claims.items())))
+
+    def _deadline(self, mid, row):
+        if row.get("kind") == "worker":
+            return min(row["last"] + WORKER_LEASE_SECONDS,
+                       row["started_at"] + WORKER_MAX_SECONDS)
+        if row.get("kind") == "event":
+            return row["last"] + FIRST_STALE
+        # Upgrade legacy rows conservatively: a marker is not a heartbeat.
+        marker = self.started / (mid + ".started")
+        if marker.exists():
+            return min(marker.stat().st_mtime + WORKER_LEASE_SECONDS,
+                       row["first"] + STARTED_STALE)
+        return row["last"] + FIRST_STALE
+
+    def _alive(self, mid, row):
+        return bool(row) and self.clock() < self._deadline(mid, row)
+
+    def _records(self):
+        records = {}
+        for path in Path(self.store.inbox_dir).glob("*.json"):
+            record = load_json(str(path), {}) or {}
+            if not isinstance(record, dict) or not record.get("from_user_id"):
+                continue
+            try:
+                mid = safe_message_id(record.get("message_id"))
+            except (TypeError, ValueError):
+                continue
+            if mid == path.stem:
+                records[mid] = dict(record, message_id=mid)
+        return records
+
+    @staticmethod
+    def _order(record):
+        at = record.get("received_at", 0)
+        return (at if isinstance(at, (int, float)) else 0, str(record["message_id"]))
+
+    def _trace(self, stage, ids, **fields):
+        try:
+            print("latency " + json.dumps(dict(stage=stage, at=self.clock(),
+                  message_ids=ids, count=len(ids), **fields)), file=sys.stderr)
+        except Exception:
+            # Observability must not break ownership or an admitted reply.
+            pass
+
+    def _batch(self, claims, lease, records=None):
+        records = records if records is not None else self._records()
+        messages = sorted((record for mid, record in records.items()
+                           if claims.get(mid, {}).get("lease") == lease and
+                           self._alive(mid, claims[mid])), key=self._order)
+        ids = [record["message_id"] for record in messages]
+        if not ids:
+            return {"lease": lease, "owned": [], "messages": [], "error": "lease_lost"}
+        return {"lease": lease, "owned": ids, "messages": messages,
+                "to": messages[-1]["from_user_id"],
+                "context": messages[-1].get("context_token", ""),
+                "expires_at": min(self._deadline(mid, claims[mid]) for mid in ids),
+                "hard_deadline": min(claims[mid].get("started_at", claims[mid]["first"])
+                                     + WORKER_MAX_SECONDS for mid in ids),
+                "renew_after_seconds": RENEW_EVERY_SECONDS}
+
+    def _collect(self, claims, lease, sender, template, records):
+        """Join arrivals to the sender's owner, never split an active worker."""
+        added = []
+        rw = self._rewakes()
+        recovered = False
+        for mid, record in records.items():
+            if record["from_user_id"] != sender or self._receipt(mid).get("status") == "complete":
+                continue
+            if self.covered(mid):
+                continue
+            previous = claims.get(mid)
+            if (previous and previous["lease"] != lease and
+                    previous.get("kind") != "event" and self._alive(mid, previous)):
+                continue
+            if previous and previous["lease"] != lease and not self._alive(mid, previous):
+                retry = rw.get(mid, {"count": 0, "last": 0})
+                if retry["count"] >= REWAKE_MAX:
+                    continue
+                rw[mid] = {"count": retry["count"] + 1, "last": int(self.clock())}
+                recovered = True
+            if not previous or previous["lease"] != lease:
+                added.append(mid)
+            claims[mid] = dict(template, lease=lease)
+        if recovered:
+            atomic_write_json(str(self.rewake_path), rw)
+        return added
 
     def _rewakes(self):
         rows = load_json(str(self.rewake_path))
@@ -175,18 +270,30 @@ class WorkerState:
         return None
 
     def claim(self, ids, lease=None):
+        """Compatibility/manual entry. Workers use begin/refresh instead."""
+        supplied_lease = lease is not None
         lease = lease or uuid.uuid4().hex
         if not lease or any(c.isspace() for c in lease):
             raise ValueError("invalid lease")
         result = {"lease": lease, "claimed": [], "owned": [], "skipped": {}}
         with self.locked():
             claims, seen = self._claims(), set(self._seen())
+            records = self._records()
+            owned_rows = [(mid, row) for mid, row in claims.items() if row["lease"] == lease]
+            if ((supplied_lease and not owned_rows) or
+                    any(not self._alive(mid, row) or row.get("kind") != "worker"
+                        for mid, row in owned_rows)):
+                result["skipped"] = {safe_message_id(mid): "lease_lost" for mid in ids}
+                return result
+            now = int(self.clock())
+            template = dict(owned_rows[0][1]) if owned_rows else {
+                "first": now, "last": now, "lease": lease, "kind": "worker", "started_at": now}
             for value in ids:
                 mid = safe_message_id(value)
                 if mid in seen or self._receipt(mid).get("status") == "complete":
                     result["skipped"][mid] = "complete"
                     continue
-                if not (Path(self.store.inbox_dir) / (mid + ".json")).is_file():
+                if mid not in records:
                     result["skipped"][mid] = "missing"
                     continue
                 coverage = self.covered(mid)
@@ -200,27 +307,40 @@ class WorkerState:
                     else:
                         result["skipped"][mid] = "claimed"
                     continue
-                now = int(self.clock())
-                claims[mid] = {"first": now, "last": now, "lease": lease}
+                sender = records[mid]["from_user_id"]
+                if any(other in records and records[other]["from_user_id"] == sender and
+                       row["lease"] != lease and self._alive(other, row)
+                       for other, row in claims.items()):
+                    result["skipped"][mid] = "sender_busy"
+                    continue
+                if owned_rows and any(records.get(other, {}).get("from_user_id") != sender
+                                      for other, _ in owned_rows):
+                    result["skipped"][mid] = "different_sender"
+                    continue
+                claims[mid] = dict(template)
                 atomic_write_text(str(self.started / (mid + ".started")), str(now))
                 result["claimed"].append(mid)
+                owned_rows.append((mid, claims[mid]))
             self._write_claims(claims)
         return result
 
     def adopt(self, ids, lease):
-        """Start only the exact Hook lease; a late old worker cannot steal it."""
+        """Consume one event and return its sender's entire available batch."""
         # Consume the event capability once. Duplicate platform deliveries of
         # the same payload cannot both start workers under the public lease.
         result = {"lease": uuid.uuid4().hex, "owned": [], "skipped": {}, "covered": {}}
         with self.locked():
-            claims = self._claims()
+            claims, records = self._claims(), self._records()
             complete = []
+            eligible = []
             for value in ids:
                 mid = safe_message_id(value)
                 if self._receipt(mid).get("status") == "complete":
                     result["skipped"][mid] = "complete"
                     continue
-                if claims.get(mid, {}).get("lease") != lease:
+                row = claims.get(mid, {})
+                if (row.get("lease") != lease or row.get("kind") == "worker" or
+                        not self._alive(mid, row)):
                     result["skipped"][mid] = "lease_lost"
                     continue
                 coverage = self.covered(mid)
@@ -229,14 +349,75 @@ class WorkerState:
                     if coverage["status"] in ("pending", "sending", "sent", "queued"):
                         complete.append(mid)
                     continue
-                if not (Path(self.store.inbox_dir) / (mid + ".json")).is_file():
+                if mid not in records:
                     result["skipped"][mid] = "missing"
                     continue
-                claims[mid]["lease"] = result["lease"]
-                atomic_write_text(str(self.started / (mid + ".started")), str(int(self.clock())))
-                result["owned"].append(mid)
+                eligible.append(mid)
+            senders = {records[mid]["from_user_id"] for mid in eligible}
+            if len(senders) > 1:
+                raise ValueError("one worker batch must have one sender")
+            if eligible:
+                sender = senders.pop()
+                busy = any(mid in records and records[mid]["from_user_id"] == sender and
+                           row["lease"] != lease and row.get("kind") != "event" and
+                           self._alive(mid, row) for mid, row in claims.items())
+                if busy:
+                    result["skipped"].update({mid: "sender_busy" for mid in eligible})
+                else:
+                    now = int(self.clock())
+                    wake_planned_at = min(claims[mid]["last"] for mid in eligible)
+                    template = {"first": min(claims[mid]["first"] for mid in eligible),
+                                "last": now, "lease": result["lease"],
+                                "kind": "worker", "started_at": now}
+                    self._collect(claims, result["lease"], sender, template, records)
+                    for mid, row in claims.items():
+                        if row["lease"] == result["lease"]:
+                            atomic_write_text(str(self.started / (mid + ".started")), str(now))
+                    result.update(self._batch(claims, result["lease"], records))
+                    self._trace("adopted", result["owned"], worker_started_at=now,
+                                wake_planned_at=wake_planned_at)
             self._complete(complete, claims)
         return result
+
+    def begin(self, lease):
+        # Discovery may race; adopt validates again under both locks.
+        ids = [mid for mid, row in self._claims().items() if row["lease"] == lease]
+        return self.adopt(ids, lease)
+
+    def refresh(self, lease):
+        """Renew only a live worker after real progress and collect arrivals."""
+        with self.locked():
+            claims, records = self._claims(), self._records()
+            owned = [(mid, row) for mid, row in claims.items() if row["lease"] == lease]
+            if not owned or any(row.get("kind") != "worker" or not self._alive(mid, row)
+                                for mid, row in owned):
+                return {"lease": lease, "owned": [], "messages": [], "error": "lease_lost"}
+            senders = {records[mid]["from_user_id"] for mid, _ in owned if mid in records}
+            if len(senders) != 1:
+                raise ValueError("invalid sender batch")
+            template = dict(owned[0][1], last=int(self.clock()))
+            self._collect(claims, lease, senders.pop(), template, records)
+            self._write_claims(claims)
+            result = self._batch(claims, lease, records)
+            self._trace("renewed", result["owned"], expires_at=result.get("expires_at"))
+            return result
+
+    def release(self, lease):
+        """Explicitly relinquish a live worker on an actionable failure."""
+        with self.locked():
+            claims = self._claims()
+            ids = [mid for mid, row in claims.items() if row["lease"] == lease]
+            # Keep an expired claim, so the recovery budget is not reset.
+            for mid in ids:
+                claims[mid]["last"] = 0
+                claims[mid]["kind"] = "event"
+                claims[mid]["started_at"] = 0
+                try:
+                    (self.started / (mid + ".started")).unlink()
+                except FileNotFoundError:
+                    pass
+            self._write_claims(claims)
+            return {"released": ids}
 
     def complete(self, ids, lease):
         with self.locked():
@@ -252,9 +433,14 @@ class WorkerState:
             self._complete(normalized, claims)
         return {"completed": normalized}
 
-    def enqueue_reply(self, ids, to, context, text, lease, media_path=None):
+    def reply(self, ids, text, lease, media_path=None):
+        return self.enqueue_reply(ids, None, None, text, lease, media_path,
+                                  collect_batch=True)
+
+    def enqueue_reply(self, ids, to, context, text, lease, media_path=None,
+                      collect_batch=False):
         normalized = list(dict.fromkeys(safe_message_id(mid) for mid in ids))
-        if not normalized or not to or not isinstance(text, str):
+        if not normalized or (not to and not collect_batch) or not isinstance(text, str):
             raise ValueError("ids, recipient and a text string required")
         media = None
         if media_path is not None:
@@ -264,21 +450,44 @@ class WorkerState:
         if not text.strip() and media is None:
             raise ValueError("reply text or a regular media file required")
         with self.locked():
-            claims = self._claims()
+            claims, records = self._claims(), self._records()
             for mid in normalized:
-                if claims.get(mid, {}).get("lease") != lease:
+                row = claims.get(mid, {})
+                if (row.get("lease") != lease or row.get("kind") != "worker" or
+                        not self._alive(mid, row)):
                     raise ValueError("lease lost for " + mid)
+            if collect_batch:
+                senders = {records.get(mid, {}).get("from_user_id") for mid in normalized}
+                if len(senders) != 1 or None in senders:
+                    raise ValueError("invalid sender batch")
+                template = dict(claims[normalized[0]])
+                self._collect(claims, lease, senders.pop(), template, records)
+                batch = self._batch(claims, lease, records)
+                self._write_claims(claims)
+                if set(normalized) != set(batch["owned"]):
+                    return dict(batch, error="needs_refresh")
+                normalized, to, context = batch["owned"], batch["to"], batch["context"]
+            for mid in normalized:
                 coverage = self.covered(mid)
                 if coverage:
                     raise ValueError("reply already registered for %s (%s)" % (mid, coverage["status"]))
                 record = load_json(os.path.join(self.store.inbox_dir, mid + ".json"), {})
                 if not isinstance(record, dict) or record.get("from_user_id") != to:
                     raise ValueError("recipient does not match owned inbox")
+            # Disk inspection can be slow on a busy state directory. Never
+            # publish after the deadline merely because validation began early.
+            if any(not self._alive(mid, claims[mid]) for mid in normalized):
+                raise ValueError("lease lost before publication")
             latest = normalized[-1]
             name = latest + ".json"
             job = {"message_id": latest, "to_user_id": to, "context_token": context,
                    "text": text, "covers_message_ids": normalized,
-                   "enqueued_at": self.clock(), "client_key": "worker:" + latest}
+                   "enqueued_at": self.clock(), "client_key": "worker:" + latest,
+                   "worker_started_at": min(claims[mid]["started_at"] for mid in normalized)}
+            received = [records[mid].get("received_at") for mid in normalized if mid in records]
+            received = [at for at in received if isinstance(at, (int, float))]
+            if received:
+                job["received_at"] = min(received)
             if media is not None:
                 # The sender owns upload/type/size checks. Keep the exact path
                 # in the same private immutable task as its caption/identity.
@@ -296,6 +505,10 @@ class WorkerState:
             registry["phase"] = "admitted"
             atomic_write_json(str(registry_path), registry)
             self._complete(normalized, claims)
+            self._trace("enqueued", normalized, job_id=latest,
+                        enqueued_at=job["enqueued_at"],
+                        worker_started_at=job["worker_started_at"],
+                        received_at=job.get("received_at"))
         return {"queued": name, "covers_message_ids": normalized, "completed": normalized}
 
     def recover_prepared(self, job_name):
@@ -421,50 +634,66 @@ class WorkerState:
                     if path.stem not in present:
                         path.unlink()
                 new, rewoken, stuck = [], [], []
-                lease = uuid.uuid4().hex
-                selected = []
+                records = self._records()
+                available = {}
                 for mid, path in candidates:
                     coverage = self.covered(mid)
                     if coverage and coverage["status"] in ("pending", "sending", "sent", "queued"):
                         self._complete([mid], claims)
                         continue
-                    if coverage and coverage["status"] in ("failed", "uncertain"):
-                        # failed jobs are handled above. Uncertain publication
-                        # must be reported, never counted as delivered.
+                    if coverage:
                         if coverage["status"] == "uncertain":
                             stuck.append(mid + ".json")
                         continue
-                    claim = claims.get(mid)
-                    if claim:
-                        age = now - claim["first"]
-                        marker = self.started / (mid + ".started")
-                        row = rw.get(mid, {"count": 0, "last": 0})
-                        if age < CLAIM_STALE:
-                            eligible = age >= FIRST_STALE
-                            if marker.exists():
-                                eligible = eligible and now - marker.stat().st_mtime >= STARTED_STALE
-                            elif row["count"]:
-                                eligible = eligible and now - row["last"] >= REWAKE_INTERVAL
-                            if not eligible or (row["count"] and now - row["last"] < REWAKE_INTERVAL):
-                                continue
-                            if row["count"] >= REWAKE_MAX:
-                                stuck.append(mid + ".json")
-                                continue
-                            rewoken.append(path)
-                            rw[mid] = {"count": row["count"] + 1, "last": now}
-                        else:
-                            new.append(path)
-                            rw.pop(mid, None)
+                    if mid in records:
+                        available[mid] = path
+                # One live owner per sender. New arrivals join its existing
+                # deadline; receiving traffic is NOT worker progress.
+                owners = {}
+                for mid in sorted(available, key=lambda key: self._order(records[key])):
+                    row = claims.get(mid)
+                    if row and self._alive(mid, row):
+                        sender = records[mid]["from_user_id"]
+                        previous = owners.get(sender)
+                        if previous is None or (row.get("kind") == "worker" and
+                                                previous.get("kind") != "worker"):
+                            owners[sender] = row
+                waiting = {}
+                for mid in sorted(available, key=lambda key: self._order(records[key])):
+                    row = claims.get(mid)
+                    if row and self._alive(mid, row):
+                        continue
+                    retry = rw.get(mid, {"count": 0, "last": 0})
+                    if row and retry["count"] >= REWAKE_MAX:
+                        stuck.append(mid + ".json")
+                        continue
+                    sender = records[mid]["from_user_id"]
+                    owner = owners.get(sender)
+                    if owner:
+                        if row:
+                            rw[mid] = {"count": retry["count"] + 1, "last": now}
+                        claims[mid] = dict(owner)
                     else:
-                        new.append(path)
-                    selected.append(mid)
-                    claims[mid] = {"first": claim["first"] if claim and now - claim["first"] < CLAIM_STALE else now,
-                                   "last": now, "lease": lease}
-                    # Old marker cannot protect a newly assigned lease.
+                        waiting.setdefault(sender, []).append(mid)
+                lease = uuid.uuid4().hex
+                selected = next(iter(waiting.values()), [])
+                for mid in selected:
+                    row = claims.get(mid)
+                    if row:
+                        retry = rw.get(mid, {"count": 0, "last": 0})
+                        rw[mid] = {"count": retry["count"] + 1, "last": now}
+                        rewoken.append(available[mid])
+                    else:
+                        new.append(available[mid])
+                    claims[mid] = {"first": row["first"] if row else now,
+                                   "last": now, "lease": lease,
+                                   "kind": "event", "started_at": 0}
                     try:
                         (self.started / (mid + ".started")).unlink()
                     except FileNotFoundError:
                         pass
+                if selected:
+                    self._trace("wake_planned", selected, wake_planned_at=now)
                 active_notices.update("stuck:" + name for name in stuck)
                 if selected:
                     result = {"decision": "wake", "reason": "new_wechat_message",
@@ -598,6 +827,16 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("ids", nargs="+")
         p.add_argument("--lease", required=name != "claim")
+    for name in ("begin", "refresh", "release"):
+        p = sub.add_parser(name)
+        p.add_argument("--lease", required=True)
+    p = sub.add_parser("reply")
+    p.add_argument("--ids", nargs="+", required=True)
+    p.add_argument("--lease", required=True)
+    text_args = p.add_mutually_exclusive_group()
+    text_args.add_argument("--text")
+    text_args.add_argument("--text-file")
+    p.add_argument("--media-path")
     p = sub.add_parser("enqueue-reply")
     p.add_argument("--ids", nargs="+", required=True)
     for name in ("to", "context", "lease"):
@@ -633,6 +872,11 @@ def main(argv=None):
         result = state.claim(args.ids, args.lease)
     elif args.command == "adopt":
         result = state.adopt(args.ids, args.lease)
+    elif args.command in ("begin", "refresh", "release"):
+        result = getattr(state, args.command)(args.lease)
+    elif args.command == "reply":
+        reply_text = Path(args.text_file).read_text() if args.text_file else (args.text or "")
+        result = state.reply(args.ids, reply_text, args.lease, args.media_path)
     elif args.command == "complete":
         result = state.complete(args.ids, args.lease)
     elif args.command == "enqueue-reply":
