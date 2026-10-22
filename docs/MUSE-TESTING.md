@@ -52,7 +52,7 @@ python3 -m venv ~/workspace/wechat-bridge-qa-venv
 | B3 后到消息 | worker 已 begin、尚未 reply 时继续发消息，跨越至少一轮 Hook 轮询 | 后到消息归同一 owner；refresh 获取它们，或 reply 返回 needs_refresh 后重组；不能遗漏内容、不能仅补 ID。新到发生在入队临界区之后的消息应进入下一批次，不算丢失 |
 | B4 重复/并发 wake | 在隔离测试环境让同事件并发/重复到达，并在 owner 活跃时发生下一次轮询 | 同事件只有一个 begin 成功；迟到 sibling 退出；无分裂所有权或重复 reply_batches。不同发送者仍各自处理，不混入一条回复 |
 | B5 owner 中途死亡 | 隔离测试中确认 begin 已成功、尚无 reply_batches，然后让该平台 worker 结束，保持 Hook/serve 正常 | 从最后一次有效 begin/refresh 起不超过约 90+5 秒即可重新计划；新 worker 接管全部未处理消息。另记平台实际启动新 worker 的延迟；不再因旧 700/600 秒阈值占位十几分钟 |
-| B6 静默与硬上限 | 隔离测试 owner 不再取得进展，或仅真实进展间隔续租 | 无续租到 90 秒失效；有续租也最迟 begin 起 570 秒失效，早于已知平台 600 秒上限。后到消息和旧 started 文件不能续命；没有脱离 worker 的后台心跳 |
+| B6 静默与硬上限 | 隔离测试 owner 不再取得进展，或仅真实进展间隔续租 | 无续租到 90 秒失效；有续租也最迟 begin 起 570 秒失效。平台的 600 秒可能从更早的开工时刻计时；若提前结束，仍须由 90 秒静默租约恢复。后到消息和旧 started 文件不能续命；没有脱离 worker 的后台心跳 |
 | B7 过期 fencing | 保留旧私有 lease，在其过期后、新 owner 接管前后分别尝试 refresh/reply | 均拒绝旧身份；无旧批次入队，不影响新 owner；新 owner 正常回复。不能只以旧 adopt 返回 lease_lost 判定整条恢复路径通过 |
 | B8 未启动与预算 | 事件已计划但不 begin；另用隔离状态重复触发失败接管 | 事件在 180 秒到期后下一轮可重计划；每条消息恢复 3 次后进入可见卡住告警，添加新消息或更换 lease 不重置预算 |
 
