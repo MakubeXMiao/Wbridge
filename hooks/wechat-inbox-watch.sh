@@ -9,6 +9,16 @@
 # 重新唤醒，避免消息永久没人管。worker 若把 wake payload 之外的消息
 # 并入同一条合并回复，必须先自己往 CLAIM 里原子补记该消息（见 worker
 # prompt），hook 容忍 worker 追加的行（两字段或三字段皆可）。
+# 超时重唤醒（2026-10-22 事故驱动加）：认领只是租约，唤醒的 worker
+# 执行本身可能丢失（2026-10-22 09:44/09:56 两条消息被认领、唤醒决定
+# 已做出，但执行未落地，消息在 inbox 静默滞留到人工发现）。首次认领
+# 满 REWAKE_STALE_SECS（600 秒）文件还在、未 seen，就当原唤醒已丢，
+# 重新唤醒一次（payload 以 rewoken_files 单列，worker 须先查
+# sent/pending 有无同名任务、防重复回复）；同一消息两次重唤醒至少
+# 间隔 600 秒、最多 3 次，状态记 wechat_inbox_rewake.txt；3 次用尽
+# 再过 600 秒仍没处理，唤醒一次 wechat_stuck_message 让 worker 向
+# 用户报告（同一条只报一次，文件消失后条目自动清、重置）。6 小时
+# 兜底排在重唤醒之后，语义不变。
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -21,6 +31,9 @@ NOTIFIED="$STATE_DIR/wechat_relogin_notified"
 DOWN_NOTIFIED="$STATE_DIR/wechat_serve_down_notified"
 FAILED_NOTIFIED="$STATE_DIR/wechat_failed_notified.txt"
 CLAIM_STALE_SECS=21600   # 6 小时：认领兜底过期（worker 假死时重新唤醒）
+REWAKE="$STATE_DIR/wechat_inbox_rewake.txt"
+REWAKE_STALE_SECS=600    # 首次认领满 10 分钟未处理：视为唤醒丢失，重唤醒
+REWAKE_MAX=3             # 同一消息最多重唤醒次数，用尽后转卡死告警
 mkdir -p "$STATE_DIR"
 touch "$SEEN" "$CLAIM" "$FAILED_NOTIFIED"
 
@@ -265,8 +278,30 @@ if [ "$DRY" != "1" ]; then
   rm -f "$tmp_claim"
 fi
 
-# 新消息扫描
+# 超时重唤醒状态装载：行格式 "id 已重唤醒次数 上次重唤醒ts 已告警0/1"。
+# 装载时顺带清理：inbox 文件已消失（=已处理完）或已 seen 的条目丢弃，
+# 卡死告警状态随之重置。该文件只由本脚本读写，脚本整程锁已串行化，
+# 不需要额外加锁。dry run 只读不落盘。
+declare -A RW_CNT RW_LAST RW_AL RW_LISTED
+rw_ids=()
+if [ -f "$REWAKE" ]; then
+  while read -r rid rcnt rlast ral _rx; do
+    [ -n "$rid" ] || continue
+    case "$rcnt" in ''|*[!0-9]*) rcnt=0 ;; esac
+    case "$rlast" in ''|*[!0-9]*) rlast=0 ;; esac
+    case "$ral" in ''|*[!0-9]*) ral=0 ;; esac
+    if [ -f "$BASE/inbox/$rid.json" ] && ! grep -qx "$rid" "$SEEN" 2>/dev/null; then
+      RW_CNT[$rid]="$rcnt"; RW_LAST[$rid]="$rlast"; RW_AL[$rid]="$ral"
+      RW_LISTED[$rid]=1; rw_ids+=("$rid")
+    fi
+  done < "$REWAKE"
+fi
+
+# 新消息扫描（含超时重唤醒判定）
 wake_files=()
+rewake_files=()
+stuck_files=()
+declare -A RW_FIRE RW_ALERT RW_DROP
 for f in "$BASE"/inbox/*.json; do
   [ -e "$f" ] || continue
   id="$(basename "$f" .json)"
@@ -280,10 +315,29 @@ for f in "$BASE"/inbox/*.json; do
       ''|*[!0-9]*)
         continue ;;  # 认领行格式异常：保守按「已认领」处理，不重复唤醒
       *)
-        if [ $((now - first_ts)) -lt "$CLAIM_STALE_SECS" ]; then
+        claim_age=$((now - first_ts))
+        if [ "$claim_age" -ge "$CLAIM_STALE_SECS" ]; then
+          : # 首次认领超 6 小时兜底：落到下方按新消息重新唤醒（原逻辑）
+          if [ -n "${RW_LISTED[$id]:-}" ]; then
+            RW_DROP[$id]=1  # 既然按新消息重走，重唤醒状态一并清掉
+          fi
+        elif [ "$claim_age" -ge "$REWAKE_STALE_SECS" ]; then
+          # 已认领未满 6 小时但超过重唤醒阈值：原唤醒大概率已丢失
+          rcnt="${RW_CNT[$id]:-0}"; rlast="${RW_LAST[$id]:-0}"; ral="${RW_AL[$id]:-0}"
+          if [ "$rcnt" -lt "$REWAKE_MAX" ]; then
+            if [ "$rlast" -eq 0 ] || [ $((now - rlast)) -ge "$REWAKE_STALE_SECS" ]; then
+              rewake_files+=("$f")
+              RW_FIRE[$id]=1
+            fi
+          elif [ "$ral" -eq 0 ] && [ $((now - rlast)) -ge "$REWAKE_STALE_SECS" ]; then
+            stuck_files+=("$(basename "$f")")
+            RW_ALERT[$id]=1
+          fi
+          continue
+        else
           continue  # 已有 worker 在处理（租约有效），不重复唤醒
         fi
-        ;;  # 首次认领超兜底时长且文件还在：worker 大概率已死，重新唤醒
+        ;;
     esac
   fi
   wake_files+=("$f")
@@ -292,15 +346,65 @@ for f in "$BASE"/inbox/*.json; do
   fi
 done
 
-if [ "${#wake_files[@]}" -eq 0 ]; then
+# 决定本轮唤醒：新消息/重唤醒优先（卡死告警等没有其他唤醒的轮次再发，
+# 反正下一轮 5 秒后就到）；状态落盘只在决定做出后、且仅非 dry 时进行。
+fire_msg=0; fire_stuck=0
+if [ "${#wake_files[@]}" -gt 0 ] || [ "${#rewake_files[@]}" -gt 0 ]; then
+  fire_msg=1
+elif [ "${#stuck_files[@]}" -gt 0 ]; then
+  fire_stuck=1
+fi
+if [ "$DRY" != "1" ]; then
+  tmp_rw="$(mktemp)"
+  for rid in "${rw_ids[@]}"; do
+    if [ "$fire_msg" -eq 1 ] && [ -n "${RW_DROP[$rid]:-}" ]; then
+      continue
+    fi
+    rcnt="${RW_CNT[$rid]}"; rlast="${RW_LAST[$rid]}"; ral="${RW_AL[$rid]}"
+    if [ "$fire_msg" -eq 1 ] && [ -n "${RW_FIRE[$rid]:-}" ]; then
+      rcnt=$((rcnt + 1)); rlast="$now"
+    fi
+    if [ "$fire_stuck" -eq 1 ] && [ -n "${RW_ALERT[$rid]:-}" ]; then
+      ral=1
+    fi
+    echo "$rid $rcnt $rlast $ral" >> "$tmp_rw"
+  done
+  if [ "$fire_msg" -eq 1 ]; then
+    for rid in "${!RW_FIRE[@]}"; do
+      if [ -z "${RW_LISTED[$rid]:-}" ]; then
+        echo "$rid 1 $now 0" >> "$tmp_rw"  # 此前无条目：首次重唤醒新建
+      fi
+    done
+  fi
+  cat "$tmp_rw" > "$REWAKE"
+  rm -f "$tmp_rw"
+fi
+
+if [ "$fire_stuck" -eq 1 ]; then
+  payload="$(printf '%s\n' "${stuck_files[@]}" | python3 -c '
+import json, sys
+files = [l.strip() for l in sys.stdin if l.strip()]
+print(json.dumps({"stuck_files": files}, ensure_ascii=False))')"
+  log "wechat messages stuck unprocessed after rewake cap" "$payload"
+  wake "wechat_stuck_message" "$payload"
+  exit 0
+fi
+
+if [ "$fire_msg" -eq 0 ]; then
   silent "no new wechat messages" '{}'
   exit 0
 fi
 
-payload="$(python3 - "${wake_files[@]}" <<'PYEOF'
+all_files=("${wake_files[@]}" "${rewake_files[@]}")
+payload="$(python3 - "${#wake_files[@]}" "${all_files[@]}" <<'PYEOF'
 import json, sys
-print(json.dumps({"files": sys.argv[1:]}, ensure_ascii=False))
+n = int(sys.argv[1])
+files = sys.argv[2:]
+print(json.dumps({"files": files[:n], "rewoken_files": files[n:]}, ensure_ascii=False))
 PYEOF
 )"
+if [ "${#rewake_files[@]}" -gt 0 ]; then
+  log "stale claimed wechat messages re-woken" "$payload"
+fi
 log "new wechat inbox messages" "$payload"
 wake "new_wechat_message" "$payload"

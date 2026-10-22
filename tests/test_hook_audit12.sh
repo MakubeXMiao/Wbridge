@@ -54,9 +54,12 @@ out="$(run_hook)"
 echo "$out" | grep -q '"reason":"new_wechat_message"'; check "hook S1 新消息唤醒" $?
 grep -q "^1001 " "$CLAIM"; check "hook S1 认领已登记" $?
 
-# S2：第 2 项核心——认领 1000 秒前（旧语义 900 秒已过期）但文件还在、未 seen
+# S2：第 2 项核心——认领未超时（300 秒前）但文件还在、未 seen
 # → 应续租静默，而不是重复唤醒第二个 worker
-echo "1001 $(( $(now) - 1000 ))" > "$CLAIM"
+# （2026-10-22 语义更新：首次认领满 600 秒未处理改为「超时重唤醒」，
+# 1000 秒的旧场景现在会以 rewoken_files 重唤醒，见 test_hook_rewake.sh R1；
+# 本例改用 300 秒验证续租不重唤的原语义。）
+echo "1001 $(( $(now) - 300 ))" > "$CLAIM"
 out="$(run_hook)"
 echo "$out" | grep -q '"decision":"silent"'; check "hook S2 过期租约被续租不重唤" $?
 ts="$(awk '$1==1001 {print $NF}' "$CLAIM" | tail -1)"
