@@ -26,7 +26,7 @@ REWAKE_MAX = 3
 # make real progress and renew; a detached timer must never keep it alive.
 WORKER_LEASE_SECONDS = 90
 RENEW_EVERY_SECONDS = 30
-WORKER_MAX_SECONDS = 570  # release before the platform's 600s turn limit
+WORKER_MAX_SECONDS = 570  # local begin-based cap; the platform can kill earlier
 
 
 @contextmanager
