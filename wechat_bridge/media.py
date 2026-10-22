@@ -8,6 +8,8 @@
 import base64
 import hashlib
 import os
+import stat
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -40,13 +42,10 @@ def download_media(media, aes_key_override=None, dest_path=None):
     media: dict，含 encrypt_query_param / full_url / aes_key。
     注意：视频必须用 encrypt_query_param 拼的地址，full_url 的数据解密会失败。
     """
-    if aes_key_override:
-        key = aes_key_override
-        key_src = "override"
-    else:
-        raw_key = media.get("aes_key") or ""
-        key = crypto.parse_aes_key(raw_key)
-        key_src = "media.aes_key(len=%d)" % len(raw_key)
+    if not isinstance(media, dict):
+        raise ValueError("media 必须是对象")
+    if not dest_path:
+        raise ValueError("必须指定媒体保存路径")
 
     # 优先用 encrypt_query_param（视频只有这个能解开）
     urls = []
@@ -59,41 +58,72 @@ def download_media(media, aes_key_override=None, dest_path=None):
     if not urls:
         raise ValueError("media 既无 full_url 也无 encrypt_query_param")
 
-    encrypted = None
+    plain = None
+    last_error = None
+    # MAX_MEDIA_BYTES 是明文上限；PKCS7 即使整块也增加一个完整块。
+    # 这里只界定本地读取边界，不推定微信平台允许更大的上传文件。
+    cipher_limit = (MAX_MEDIA_BYTES // 16 + 1) * 16
     for name, url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=120) as resp:
-                data = resp.read(MAX_MEDIA_BYTES + 1)
+                data = resp.read(cipher_limit + 1)
             log("下载源 %s: %d 字节" % (name, len(data)))
-            if encrypted is None:
-                encrypted = data
-            break  # 用第一个成功的源
+            if len(data) > cipher_limit:
+                raise ValueError("媒体密文超过本地大小上限")
+            candidate = _decrypt_media(data, media, aes_key_override)
+            if len(candidate) > MAX_MEDIA_BYTES:
+                raise ValueError("媒体明文超过 100MB 上限")
+            plain = candidate
+            break  # 完整下载、解密及大小校验成功后才认定此源成功
         except Exception as e:
+            last_error = e
             log("下载源 %s 失败: %s" % (name, e))
-    if encrypted is None:
-        raise ValueError("所有下载源均失败")
-    if len(encrypted) > MAX_MEDIA_BYTES:
-        raise ValueError("媒体文件超过 100MB 上限")
+    if plain is None:
+        raise ValueError("所有下载源均失败: %s" % last_error)
 
+    dest_path = os.fspath(dest_path)
+    directory = os.path.dirname(os.path.abspath(dest_path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".media-")
     try:
-        plain = crypto._aes_ecb_decrypt(encrypted, key)
-    except Exception as e:
-        log("主解密失败(%s)，尝试其他组合…" % e)
-        raw_key = "" if aes_key_override else (media.get("aes_key") or "")
-        plain, strategy = crypto.try_decrypt_variants(encrypted, raw_key, aes_key_override)
-        if plain is None:
-            log("所有解密组合均失败，放弃 (密钥来源=%s)" % key_src)
-            raise
-        log("解密成功，策略: %s" % strategy)
-
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    tmp = dest_path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(plain)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, dest_path)
+        with os.fdopen(fd, "wb") as f:
+            f.write(plain)
+        os.replace(tmp, dest_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return dest_path
+
+
+def _decrypt_media(encrypted, media, aes_key_override):
+    """旧字段密钥无效/解密失败时，仍尝试合法的 media.aes_key。"""
+    candidates = []
+    for source in (aes_key_override, media.get("aes_key") or ""):
+        try:
+            key = crypto.parse_aes_key(source)
+        except (ValueError, TypeError):
+            continue
+        if key not in candidates:
+            candidates.append(key)
+    last_error = None
+    for key in candidates:
+        try:
+            return crypto._aes_ecb_decrypt(encrypted, key)
+        except (ValueError, IndexError) as error:
+            last_error = error
+    raw_key = media.get("aes_key") or ""
+    if not isinstance(raw_key, (str, bytes)):
+        raw_key = ""
+    override = candidates[0] if candidates else None
+    plain, strategy = crypto.try_decrypt_variants(encrypted, raw_key, override)
+    if plain is not None:
+        log("解密成功，策略: %s" % strategy)
+        return plain
+    raise ValueError("媒体密钥或密文无效: %s" % (last_error or "无合法密钥"))
 
 
 def _get_upload_target(baseurl, token, to_user_id, data, encrypted,
@@ -164,6 +194,8 @@ def upload_media(baseurl, token, to_user_id, data, item_type, heartbeat=None):
     调用一次。CDN 全挂时本函数最坏能磨 ~5 分钟，serve 靠它在长尝试
     期间持续刷新 flusher 心跳，免得 hook 把健康线程误判为卡死。
     """
+    if len(data) > MAX_MEDIA_BYTES:
+        raise ValueError("文件超过 100MB 上限")
     aes_key = os.urandom(16)
     encrypted = crypto._aes_ecb_encrypt(data, aes_key)
     upload_media_type = {ITEM_IMAGE: UPLOAD_IMAGE, ITEM_VIDEO: UPLOAD_VIDEO}.get(
@@ -234,8 +266,16 @@ def send_media_message(baseurl, token, to_user_id, context_token, file_path,
     再发一遍，图必然重复。传了 client_key 后重试复用同一 client_id，
     服务端按 client_id 去重时可免重；没传才回退随机 uuid（旧行为）。
     """
-    with open(file_path, "rb") as f:
-        data = f.read()
+    # O_NONBLOCK 避免在 fstat 能拒绝 FIFO 之前就卡在 open 上。
+    fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("只允许发送普通文件")
+        if info.st_size > MAX_MEDIA_BYTES:
+            raise ValueError("文件超过 100MB 上限")
+        # 即使文件在 fstat 后增长，也不能无界读取。
+        data = f.read(MAX_MEDIA_BYTES + 1)
     if len(data) > MAX_MEDIA_BYTES:
         raise ValueError("文件超过 100MB 上限")
     download_param, aes_key_b64, cipher_size = upload_media(

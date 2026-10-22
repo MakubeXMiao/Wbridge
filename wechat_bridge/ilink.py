@@ -136,7 +136,7 @@ def _stable_client_id(client_key, chunk_index):
 
 
 def send_message(baseurl, token, to_user_id, text, context_token, start_chunk=0,
-                 on_chunk=None, client_key=None, pace=1.5):
+                 on_chunk=None, client_key=None, pace=1.5, max_chunks=None):
     """发文本。超 2000 字自动分片多条发出，返回最后一条的响应。
 
     分片续发（P3）：返回的 resp 带 `_chunks_done`（下次应从第几片续发）和
@@ -157,14 +157,21 @@ def send_message(baseurl, token, to_user_id, text, context_token, start_chunk=0,
         pace = 1.5
     chunks = split_text(text)
     total = len(chunks)
-    if start_chunk >= total:
+    if isinstance(start_chunk, bool) or not isinstance(start_chunk, int) or start_chunk < 0 or start_chunk > total:
+        raise ValueError("invalid confirmed chunk progress")
+    if start_chunk == total:
         return {"ret": 0, "_chunks_done": total, "_chunks_total": total}
     if not client_key:
         client_key = "text:%s:%s" % (to_user_id, hashlib.md5(
             (text or "").encode("utf-8")).hexdigest()[:12])
     last_resp = {}
     done_so_far = max(0, start_chunk)
+    stop_chunk = total if max_chunks is None else min(
+        total, done_so_far + max(0, int(max_chunks)))
     for i in range(max(0, start_chunk), total):
+        if i >= stop_chunk:
+            return {"_deferred": True, "_chunks_done": done_so_far,
+                    "_chunks_total": total}
         payload = {
             "msg": {
                 "from_user_id": "",          # 必须空字符串，否则发不出去还不报错

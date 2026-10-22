@@ -16,6 +16,8 @@ def _aes_ecb_encrypt(data, key):
 
 def _aes_ecb_decrypt(data, key):
     from Crypto.Cipher import AES
+    if not data or len(data) % AES.block_size:
+        raise ValueError("AES 密文必须是非空的完整块")
     out = AES.new(key, AES.MODE_ECB).decrypt(data)
     pad = out[-1]
     if pad < 1 or pad > 16:
@@ -33,6 +35,8 @@ def parse_aes_key(s):
     """解析微信 CDN 的 aes_key。base64 严格解析（标准 + URL 安全），避免静默丢字符。"""
     if isinstance(s, str):
         s = s.encode("utf-8")
+    if not isinstance(s, (bytes, bytearray)):
+        raise ValueError("aes_key 必须是字符串或字节")
     if len(s) == 16:
         return bytes(s)
     if len(s) == 32 and _is_hex(s):
@@ -64,6 +68,8 @@ def try_decrypt_variants(encrypted, raw_key_str, key_override=None):
     （MP4 的 ftyp / JPEG 头）就用哪个。
     """
     from Crypto.Cipher import AES
+    if not encrypted or len(encrypted) % AES.block_size:
+        return None, None
     candidates = []
     raw = raw_key_str.encode("utf-8") if isinstance(raw_key_str, str) else (raw_key_str or b"")
     if key_override:

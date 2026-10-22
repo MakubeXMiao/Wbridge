@@ -1,61 +1,30 @@
-"""常驻服务：长轮询收消息 → inbox/；outbox/pending/ → sendmessage 发出。
+"""Single-owner iLink receiver and durable outbox service.
 
-2026-10-21 P1–P7 改造要点：
-- P1 任务带 attempts/next_attempt_at/enqueued_at；退避 30s→2m→10m；
-  attempts>=5 或任务龄 >30 分钟移入 outbox/failed/（死信），不再无限重试；
-  按 enqueued_at 排序，不按文件名。
-- P2 每条任务处理全程异常隔离，发送侧异常永不杀 serve；任务先原子认领
-  进 outbox/sending/ 再发，成功移 sent/，可重试失败写回 pending/；
-  get_updates_buf 只在整批消息落 inbox 后才保存；媒体下载失败的消息也写
-  inbox 占位记录（media_failed），不静默丢弃。
-- P3 配文拆成独立文本任务排在媒体任务之前（只发一次）；发送成功间隔
-  1.5s；单 context_token 在 serve 生命周期内最多发 TOKEN_SEND_CAP 条，
-  余量留给用户下一条消息；未尝试过的任务若有更新的 token 自动升级。
-- P4 resp_ok 按实测判据（sendmessage 成功响应是 {"message_id": ...}、
-  无 ret，详见 ilink.resp_ok）；sendmessage 返回 -14 时先用 getupdates
-  探活，探活也 -14 才写 NEEDS_RELOGIN（与轮询路径一致）。
-- 合并兜底（2026-10-21 加）：同一批连发的纯文本任务在 flush 时机械合并
-  为一条发出（同收件人、组内跨度 ≤120s、最新任务入队满 20s 才发），
-  防 worker 逐条回复刷屏；合并整条未送达时降级逐条发送（一条毒任务
-  不拖全组），分片部分送达时收拢续发、已达分片不重发。
-- P7 启动时 fcntl.flock 单实例锁，占不到直接退出。
-- 全盘审查 12 项（2026-10-21 晚，用户批准全修）：
-  1 sending/ 启动回收（run 拿到锁后全量移回 pending）+ status 显示计数；
-  3 分片进度异常路径不丢（异常挂 _chunks_done、on_chunk 实时落盘）+
-     client_id 由任务名+片号稳定派生；4 配文在同一次流程里先于媒体
-     送达，配文死信则媒体随之死信、配文排重试则媒体顺延；5 合并分组
-     被非文本任务截断、token 额度按实际分片数计、片间 1.5s pacing；
-  6 getupdates 先判 dict、错误响应走失败退避且不存游标不 flush；
-  7 handle_incoming 任何失败都写占位记录，落盘失败则本批不推进游标；
-  12 pending 坏文件逐个隔离到 failed/，不再堵通道。
-- 提速 A（2026-10-21 晚，用户批准「ABC 全做」）：flush 从 getupdates
-  轮询主循环拆出到独立 flusher 线程（每 FLUSH_INTERVAL_SECONDS 秒一
-  轮、_flush_lock 串行化）。闲置时轮询一轮最长挂 ~120s，旧实现里回
-  复写好也要等轮询返回才发得出，是「闲置后第一条回复慢 1–2 分钟」
-  的主因；拆开后回复落盘 ~3 秒内就被 flusher 发走。
-- 二次全盘审查修复（2026-10-21 深夜，用户批准 P1–P3 全修）：
-  P1-1 flusher 监督双保险——主循环每轮查 flusher.is_alive()，线程死
-  于锁外异常（BaseException 等）时进程内重启并记日志；flusher 每轮
-  及每个发送单元/长操作内部都刷新 state/flusher_heartbeat，hook 发
-  现 serve 进程活着但心跳 >120s 未更新时按宕机处理（杀进程重拉），
-  覆盖线程卡死而进程未死的情况。P3-1 移入 sent/ 的任务文件统一
-  chmod 0600（worker 建的 pending 文件是 umask 0660，含回复全文与
-  context_token，不该组可读）；sent/ 的 30 天保留期清理由 hook 侧做。
+Inbox publication and cursor advancement follow durable receipt writes. Replies
+are claimed atomically and journaled before network delivery. Merged envelopes
+keep their complete text, member coverage and client key across retries/crashes;
+they are never split into new identities after a delivery attempt. The sole
+flusher recovers abandoned sending files between cycles, preserves committed
+backoff/progress, and enforces per-recipient FIFO and a per-context chunk budget.
+
+A stable client ID does not prove server-side exactly-once delivery. The actual
+iLink deduplication and Muse platform scheduling still require owner acceptance.
 """
 
 import fcntl
+import math
 import os
 import threading
 import time
 
 from .ilink import (
     ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE,
-    auth_headers, http_json, is_token_invalid, resp_ok, send_message,
+    auth_headers, http_json, is_token_invalid, resp_ok, send_message, split_text,
 )
 from .media import download_media, media_type_from_path, send_media_message
 from .store import (
     Store, atomic_write_json, atomic_write_text, load_json, log,
-    mark_needs_relogin,
+    mark_needs_relogin, message_receipt_lock, quarantine_record, safe_message_id,
 )
 
 MAX_ATTEMPTS = 5
@@ -71,156 +40,242 @@ _lock_fhs = []  # 单实例锁文件句柄（进程生命周期内持有；用 l
 
 
 def extract_text(msg):
+    """Extract text independently of attachments (input validated by receiver)."""
     parts = []
     for item in msg.get("item_list") or []:
-        if item.get("type") == 1:  # 文本
-            t = (item.get("text_item") or {}).get("text")
-            if t:
-                parts.append(t)
-        elif item.get("type") == 3:  # 语音：可能带转写文本
-            t = (item.get("voice_item") or {}).get("text")
-            if t:
-                parts.append("[语音转写]" + t)
+        if item.get("type") == 1:
+            text = (item.get("text_item") or {}).get("text")
+            if text:
+                parts.append(text)
+        elif item.get("type") == ITEM_VOICE:
+            text = (item.get("voice_item") or {}).get("text")
+            if text:
+                parts.append("[语音转写]" + text)
     return "".join(parts)
+
+
+def _publish_context(store, record, received_at):
+    """Publish monotonically, including repair of an interrupted inbox adopt."""
+    current = load_json(store.last_ctx_path) or {}
+    if not isinstance(current, dict):
+        current = {}
+    current_at = current.get("received_at")
+    if not isinstance(current_at, (int, float)):
+        try:
+            current_at = time.mktime(time.strptime(current.get("updated_at", ""), "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, TypeError, OverflowError):
+            current_at = 0
+    if received_at < current_at:
+        return
+    atomic_write_json(store.last_ctx_path, {
+        "to_user_id": record["from_user_id"],
+        "context_token": record.get("context_token") or "",
+        "message_id": record["message_id"], "received_at": received_at,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def _receipt_known_locked(store, message_id, from_id):
+    """Called under message_receipt_lock; adopt pre-ledger inbox records too."""
+    receipt_path = os.path.join(store.receipts_dir, message_id + ".json")
+    inbox_path = os.path.join(store.inbox_dir, message_id + ".json")
+    if os.path.exists(receipt_path):
+        receipt = load_json(receipt_path)
+        if (not isinstance(receipt, dict)
+                or safe_message_id(receipt.get("message_id")) != message_id
+                or receipt.get("from_user_id") != from_id
+                or receipt.get("status") not in ("received", "complete")):
+            raise ValueError("existing message receipt is inconsistent")
+        return True
+    if os.path.exists(inbox_path):
+        existing = load_json(inbox_path)
+        if (not isinstance(existing, dict)
+                or safe_message_id(existing.get("message_id")) != message_id
+                or existing.get("from_user_id") != from_id):
+            raise ValueError("existing inbox record is inconsistent")
+        received_at = existing.get("received_at")
+        if not isinstance(received_at, (int, float)):
+            received_at = os.path.getmtime(inbox_path)
+        _publish_context(store, existing, received_at)
+        atomic_write_json(receipt_path, {
+            "message_id": message_id, "from_user_id": from_id,
+            "status": "received", "received_at": time.time(),
+        })
+        return True
+    return False
 
 
 def _write_inbox_record(store, msg, from_id, text, media_paths=None,
                         media_failed=0):
-    """写 inbox 记录。返回 True 表示落盘成功。
+    """Publish inbox then durable receipt while excluding worker completion.
 
-    审查第 7 项：本函数的异常由调用方兜底处理（失败意味着本批游标
-    不能推进），不在这里吞。
+    A receipt remains after the worker deletes the inbox, so upstream replay
+    cannot resurrect a completed task when the Hook trims its seen cache.
     """
-    message_id = msg.get("message_id")
+    message_id = safe_message_id(msg.get("message_id"))
     record = {
-        "message_id": message_id,
-        "text": text,
+        "message_id": msg["message_id"], "text": text,
         "from_user_id": from_id,
         "context_token": msg.get("context_token") or "",
         "create_time_ms": msg.get("create_time_ms"),
+        "received_at": time.time(),
     }
     if media_paths:
         record["media_paths"] = media_paths
     if media_failed:
         record["media_failed"] = True
         record["media_failed_count"] = media_failed
-    path = os.path.join(store.inbox_dir, "%s.json" % message_id)
-    if not os.path.exists(path):
+    with message_receipt_lock(store):
+        if _receipt_known_locked(store, message_id, from_id):
+            return True
+        path = os.path.join(store.inbox_dir, message_id + ".json")
         atomic_write_json(path, record)
-        log("收到消息 [%s]: %s" % (message_id, (text or "")[:60]))
-    # 缓存最新会话上下文，供 send 测试用
-    atomic_write_json(store.last_ctx_path, {
-        "to_user_id": from_id,
-        "context_token": record["context_token"],
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
+        # Context is only updated for a newly received message. A replay must
+        # not downgrade the latest context token to an old message's token.
+        _publish_context(store, record, record["received_at"])
+        atomic_write_json(os.path.join(store.receipts_dir, message_id + ".json"), {
+            "message_id": message_id, "from_user_id": from_id,
+            "status": "received", "received_at": time.time(),
+        })
+    log("收到消息 [%s]（text_chars=%d media=%d media_failed=%d）" % (
+        message_id, len(text), len(media_paths or []), media_failed))
     return True
 
 
+def _quarantine_incoming(store, payload, reason):
+    """Only a durable quarantine counts as accepted; failed writes retain cursor."""
+    try:
+        return quarantine_record(store, payload, reason)
+    except Exception as error:
+        log("接收隔离写入失败，本批游标保留（%s）" % type(error).__name__)
+        return False
+
+
+def _incoming_shape_error(msg):
+    if not isinstance(msg, dict):
+        return "message_not_object"
+    if type(msg.get("message_type")) is not int:
+        return "message_type_invalid"
+    if msg.get("message_type") != 1 or msg.get("group_id"):
+        return None  # Non-user/group messages are explicitly filtered.
+    if not isinstance(msg.get("from_user_id"), str) or not msg["from_user_id"]:
+        return "sender_invalid"
+    try:
+        safe_message_id(msg.get("message_id"))
+    except ValueError:
+        return "message_id_invalid"
+    if msg.get("context_token") is not None and not isinstance(msg["context_token"], str):
+        return "context_token_invalid"
+    items = msg.get("item_list")
+    if items is None:
+        return None
+    if not isinstance(items, list):
+        return "item_list_not_array"
+    subkeys = {1: "text_item", ITEM_IMAGE: "image_item", ITEM_VOICE: "voice_item",
+               ITEM_FILE: "file_item", ITEM_VIDEO: "video_item"}
+    for item in items:
+        if not isinstance(item, dict) or type(item.get("type")) is not int:
+            return "item_invalid"
+        key = subkeys.get(item["type"])
+        if key:
+            sub = item.get(key)
+            if not isinstance(sub, dict):
+                return "item_payload_invalid"
+            if item["type"] in (1, ITEM_VOICE) and sub.get("text") is not None \
+                    and not isinstance(sub["text"], str):
+                return "item_text_invalid"
+            if item["type"] in (ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE) \
+                    and sub.get("media") is not None and not isinstance(sub["media"], dict):
+                return "item_media_invalid"
+            if item["type"] == ITEM_FILE and sub.get("file_name") is not None \
+                    and not isinstance(sub["file_name"], str):
+                return "item_filename_invalid"
+    return None
+
+
 def handle_incoming(store, msg, owner_id):
-    """处理一条收到的消息，写入 inbox/。
+    """Accept a filtered, persisted, or visibly quarantined input; never drop raw invalid data."""
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        log("机主 ID 缺失，拒绝接收；请重新确认登录会话")
+        return False
+    # Don't retain foreign message bodies, even in quarantine.
+    if isinstance(msg, dict) and isinstance(msg.get("from_user_id"), str) \
+            and msg.get("from_user_id") and msg["from_user_id"] != owner_id:
+        return True
+    reason = _incoming_shape_error(msg)
+    if reason:
+        return _quarantine_incoming(store, msg, reason)
+    if msg.get("group_id") or msg.get("message_type") != 1:
+        return True
+    from_id = msg["from_user_id"]
+    message_id = safe_message_id(msg.get("message_id"))
+    try:
+        with message_receipt_lock(store):
+            if _receipt_known_locked(store, message_id, from_id):
+                return True
+    except Exception as error:
+        log("接收账本检查失败，本批游标保留（%s）" % type(error).__name__)
+        return False
 
-    返回 True 表示消息已被「接住」：或是被策略过滤（群/非用户消息/
-    非机主，直接忽略没任何问题），或是 inbox 记录已落盘。
-    返回 False 表示记录落盘失败——调用方绝不能保存新游标，
-    否则这条消息永久丢失（审查第 7 项）。
-    """
-    if msg.get("group_id"):
-        return True  # 群消息忽略
-    if msg.get("message_type") != 1:
-        return True  # 只处理用户发来的消息（1=用户，2=Bot）
-    from_id = msg.get("from_user_id") or ""
-    if owner_id and from_id != owner_id:
-        return True  # 只处理机主微信 ID 发来的消息
-
-    text = ""
+    text = extract_text(msg)
     media_paths = []
     media_failed = 0
-    try:
-        text = extract_text(msg)
-        if not text.strip():
-            # 非文本消息：图片/视频/文件下载到本地
-            item_types = sorted({str(it.get("type")) for it in (msg.get("item_list") or [])})
-            log(f"非文本消息 [{msg.get('message_id')}] item_types={item_types}")
-            for it in (msg.get("item_list") or []):
-                itype = it.get("type")
-                sub = it.get("image_item") or it.get("video_item") or it.get("file_item")
-                if itype in (ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE) and sub:
-                    kind = {ITEM_IMAGE: "image", ITEM_VIDEO: "video"}.get(itype, "file")
-                    ext = {ITEM_IMAGE: "jpg", ITEM_VIDEO: "mp4"}.get(itype, "bin")
-                    fname = sub.get("file_name") if itype == ITEM_FILE else ""
-                    if fname:
-                        fname = "".join(c for c in fname if c not in "/\\")
-                        dest_name = "%s_%s" % (msg.get("message_id"), fname)
-                    else:
-                        dest_name = "%s_%s.%s" % (msg.get("message_id"), kind, ext)
-                    day = time.strftime("%Y%m%d")
-                    dest = os.path.join(store.media_dir, day, dest_name)
-                    # 审查第 7 项：item 级解析（aeskey 用多格式解析）也
-                    # 纳入 try——旧实现 bytes.fromhex 在 try 外，aeskey
-                    # 不是纯 hex 时整条消息在写 inbox 前就被抛掉。
-                    try:
-                        key = _media_key(sub)
-                        download_media(sub.get("media") or {}, key, dest)
-                        media_paths.append(dest)
-                        log("已下载%s -> %s" % (kind, dest))
-                    except Exception as e:
-                        media_failed += 1
-                        m = sub.get("media") or {}
-                        log("%s下载失败: %s | encrypt_type=%s full_url=%s" % (
-                            kind, e, m.get("encrypt_type"), bool(m.get("full_url"))))
-                elif itype == ITEM_VOICE:
-                    pass  # 语音转写文本已在 extract_text 中提取
-            if media_paths:
-                kinds = {".jpg": "[图片]", ".mp4": "[视频]"}
-                text = kinds.get(os.path.splitext(media_paths[0])[1], "[文件]")
-            elif media_failed:
-                # P2：媒体全下失败也写占位记录，worker/用户能知道这条消息到过
-                text = "[媒体接收失败：下载/解密失败]"
-            else:
-                text = "[不支持的消息类型]"
-    except Exception as e:
-        # 单 item 之外的意外（item_list 结构畸形等）：降级为占位记录，
-        # 不让整条消息蒸发（审查第 7 项）
-        log("处理消息内容时异常，降级占位记录: %s" % e)
-        media_failed += 1
-        if not text.strip():
-            text = "[媒体接收失败：处理异常]"
-
-    try:
-        return _write_inbox_record(store, msg, from_id, text,
-                                   media_paths, media_failed)
-    except Exception as e:
-        # 连占位记录都写不进：最后再试一条最小记录；仍失败返回 False，
-        # run() 据此不保存游标，消息会在下轮重新投递。
-        log("写入 inbox 记录失败: %s" % e)
+    kinds = {ITEM_IMAGE: ("image", "jpg", "image_item"),
+             ITEM_VIDEO: ("video", "mp4", "video_item"),
+             ITEM_FILE: ("file", "bin", "file_item"),
+             ITEM_VOICE: ("voice", "silk", "voice_item")}
+    for index, item in enumerate(msg.get("item_list") or []):
+        kind_info = kinds.get(item.get("type"))
+        if not kind_info:
+            continue
+        kind, ext, subkey = kind_info
+        sub = item[subkey]
+        if item["type"] == ITEM_VOICE and not sub.get("media"):
+            continue  # The transcription remains useful without downloadable audio.
+        filename = sub.get("file_name") if item["type"] == ITEM_FILE else ""
+        if filename:
+            # Keep readable names, but no path separators/control bytes. The
+            # item index also distinguishes duplicate/sanitized file names.
+            filename = "".join(c for c in filename if c not in "/\\" and ord(c) >= 32)
+            filename = filename.encode("utf-8")[:50].decode("utf-8", "ignore")
+        suffix = filename or (kind + "." + ext)
+        dest_name = "%s_%03d_%s" % (message_id, index, suffix)
+        dest = os.path.join(store.media_dir, time.strftime("%Y%m%d"), dest_name)
         try:
-            return _write_inbox_record(
-                store, msg, from_id, "[接收失败：记录写入异常]",
-                media_failed=media_failed + 1)
-        except Exception as e2:
-            log("最小占位记录也写入失败，本批游标不能推进: %s" % e2)
-            return False
+            download_media(sub.get("media") or {}, _media_key(sub), dest)
+            media_paths.append(dest)
+            log("已接收附件 [%s] item=%d kind=%s" % (message_id, index, kind))
+        except Exception as error:
+            media_failed += 1
+            # Exception strings may carry full_url/query secrets or file names.
+            log("附件接收失败 [%s] item=%d kind=%s（%s）" % (
+                message_id, index, kind, type(error).__name__))
+    if not text.strip():
+        if media_paths:
+            labels = {".jpg": "[图片]", ".mp4": "[视频]", ".silk": "[语音]"}
+            text = labels.get(os.path.splitext(media_paths[0])[1], "[文件]")
+        elif media_failed:
+            text = "[媒体接收失败：下载/解密失败]"
+        else:
+            text = "[不支持的消息类型]"
+    try:
+        return _write_inbox_record(store, msg, from_id, text, media_paths, media_failed)
+    except Exception as error:
+        # Never replace an actual text with a fallback placeholder after a
+        # transient write failure. Replay retains and retries the original data.
+        log("写入接收记录失败，本批游标保留（%s）" % type(error).__name__)
+        return False
 
 
 def _media_key(sub):
-    """从 image/video/file item 解析 AES 密钥（字节或 None）。
-
-    sub['aeskey'] 历史上按 hex 解；iLink 还可能给 base64 等形态，
-    统一走 crypto.parse_aes_key 的多格式解析；解析不了返回 None，
-    让 download_media 改用 media.aes_key 自行解析。
-    """
-    key_hex = sub.get("aeskey") or ""
-    if not key_hex:
+    """Use the same strict raw16/hex32/base64 parser as nested media.aes_key."""
+    value = sub.get("aeskey")
+    if not value:
         return None
     try:
-        return bytes.fromhex(key_hex)
+        from .crypto import parse_aes_key
+        return parse_aes_key(value)
     except (ValueError, TypeError):
-        pass
-    try:
-        from . import crypto
-        return crypto.parse_aes_key(key_hex)
-    except Exception:
         return None
 
 
@@ -317,6 +372,31 @@ def _return_to_pending(store, sending_path, pending_path, job):
         pass
 
 
+def _job_schema_error(job):
+    if not isinstance(job, dict):
+        return "task must be an object"
+    for field in ("text", "media_path", "to_user_id", "context_token", "client_key"):
+        if field in job and not isinstance(job[field], str):
+            return "%s must be text" % field
+    for field in ("attempts", "chunks_done"):
+        value = job.get(field, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "%s must be a nonnegative integer" % field
+    for field in ("enqueued_at", "next_attempt_at"):
+        if field not in job:
+            continue
+        value = job[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            return "%s must be a finite nonnegative timestamp" % field
+    for field in ("merged_from", "covers_message_ids"):
+        if field in job and (not isinstance(job[field], list) or
+            any(not isinstance(v, (str, int)) or isinstance(v, bool) for v in job[field])):
+            return "%s must be an ID list" % field
+    if not job.get("media_path") and job.get("chunks_done", 0) > len(split_text(job.get("text", ""))):
+        return "confirmed chunk progress exceeds text length"
+    return None
+
+
 def _list_pending(store):
     """读 pending 任务并按 enqueued_at 排序（P1）。
 
@@ -342,11 +422,14 @@ def _list_pending(store):
                         job = _json.load(f)
                 except Exception:
                     job = None
-            if not isinstance(job, dict):
+            schema_error = _job_schema_error(job) if isinstance(job, dict) else "not an object"
+            if schema_error:
+                log("invalid outbox task: %s" % schema_error, job=name)
+            if not isinstance(job, dict) or schema_error:
                 # 宽限期：文件太新可能是 worker 正在写（非原子写一半），
                 # 本轮先跳过，下轮再判，避免误杀在写任务。
                 try:
-                    if time.time() - os.path.getmtime(path) < 10:
+                    if not isinstance(job, dict) and time.time() - os.path.getmtime(path) < 10:
                         log("任务文件暂不可解析且较新，本轮跳过（可能在写）",
                             job=name)
                         continue
@@ -358,6 +441,8 @@ def _list_pending(store):
                     time.strftime("%Y%m%d%H%M%S") + ".json")
                 try:
                     os.replace(path, quarantine)
+                    if os.path.isfile(quarantine):
+                        os.chmod(quarantine, 0o600)
                     log("任务文件损坏，已隔离到 failed/: %s" % quarantine,
                         job=name)
                 except OSError as e:
@@ -415,7 +500,9 @@ def _is_mergeable_text(name, job):
     """机械合并候选：纯文本、未尝试过、无分片进度、非配文任务。"""
     if name.endswith("_caption.json") or job.get("kind") == "caption":
         return False
-    if job.get("media_path"):
+    if job.get("media_path") or job.get("client_key") or job.get("merged_from"):
+        return False
+    if job.get("delivery_state") in ("inflight", "recovered", "prepared"):
         return False
     if int(job.get("attempts") or 0) != 0:
         return False
@@ -438,11 +525,10 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
     # 一进入发送流程就打上 inflight 并落盘，配合 run() 启动时对
     # sending/ 的全量回收，serve 中途被杀也能被识别、退回重发。
     job["delivery_state"] = "inflight"
+    job.setdefault("client_key", name)
+    job["attempts"] = attempt_no
     try:
         atomic_write_json(sending_path, job)
-    except OSError:
-        pass
-    try:
         media_path = job.get("media_path") or ""
         if media_path:
             # 审查第 4 项：配文必须先于媒体送达。本轮新拆出的配文先在
@@ -490,24 +576,31 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
                 _fail_job(store, sending_path, name, job,
                           "媒体文件不存在: %s" % media_path)
                 return True
+            if counts.get(tok_key, 0) >= TOKEN_SEND_CAP:
+                job["budget_deferred"] = True
+                job["attempts"] = attempts
+                job["next_attempt_at"] = 0
+                _return_to_pending(store, sending_path, pending_path, job)
+                return True
             resp = send_media_message(
                 baseurl, token, to_user_id,
                 job.get("context_token") or "", media_path,
                 media_type_from_path(media_path),
-                client_key=name,
+                client_key=job["client_key"],
                 heartbeat=lambda: _touch_flusher_heartbeat(store))
             sent_units = 1
+            if resp_ok(resp):
+                counts[tok_key] = counts.get(tok_key, 0) + 1
         else:
             start_chunk = int(job.get("chunks_done") or 0)
 
             def _persist_chunk_progress(done, total,
                                         _job=job, _path=sending_path):
                 # 每片送达立即落盘：进程被杀也不丢已达片数（审查第 3 项）
+                previous = int(_job.get("chunks_done") or 0)
                 _job["chunks_done"] = done
-                try:
-                    atomic_write_json(_path, _job)
-                except OSError:
-                    pass
+                counts[tok_key] = counts.get(tok_key, 0) + max(0, done - previous)
+                atomic_write_json(_path, _job)
                 # 顺手刷新心跳：长文本逐片发时 flusher 显然活着（P1-1）
                 _touch_flusher_heartbeat(store)
 
@@ -516,12 +609,20 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
                 job.get("context_token") or "",
                 start_chunk=start_chunk,
                 on_chunk=_persist_chunk_progress,
-                client_key=name, pace=PACE_SECONDS)
+                client_key=job["client_key"], pace=PACE_SECONDS,
+                max_chunks=max(0, TOKEN_SEND_CAP - counts.get(tok_key, 0)))
             done = int(resp.get("_chunks_done") or 0) if isinstance(resp, dict) else 0
             total = int(resp.get("_chunks_total") or 0) if isinstance(resp, dict) else 0
             sent_units = max(0, done - start_chunk)
             if isinstance(resp, dict) and total:
                 job["chunks_done"] = done
+
+        if isinstance(resp, dict) and resp.get("_deferred"):
+            job["budget_deferred"] = True
+            job["attempts"] = attempts
+            job["next_attempt_at"] = 0
+            _return_to_pending(store, sending_path, pending_path, job)
+            return True
 
         if is_token_invalid(resp):
             # P4：先探活，探活也 -14 才判失效
@@ -537,7 +638,6 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
 
         if resp_ok(resp):
             _mark_sent(store, sending_path, name)
-            counts[tok_key] = counts.get(tok_key, 0) + max(1, sent_units)
             log("已发送回复", job=name, attempt=attempt_no)
             if PACE_SECONDS > 0:
                 time.sleep(PACE_SECONDS)
@@ -588,6 +688,8 @@ def _send_single(store, baseurl, token, counts, c):
     # P3(b) 复检：预处理之后额度可能已被前面的发送单元吃满
     tok_key = job.get("context_token") or ""
     if counts.get(tok_key, 0) >= TOKEN_SEND_CAP:
+        job["budget_deferred"] = True
+        atomic_write_json(c["pending_path"], job)
         log("context_token 发送额度已满 (%d)，任务留队等新 token"
             % TOKEN_SEND_CAP, job=name)
         return True
@@ -605,149 +707,60 @@ def _send_single(store, baseurl, token, counts, c):
                             c["enq"], int(job.get("attempts") or 0))
 
 
+def _archive_merge_member(store, name, job, anchor):
+    alias = dict(job)
+    alias["merged_into"] = anchor
+    alias["delivery_state"] = "covered"
+    atomic_write_json(os.path.join(store.sent_dir, name), alias)
+    for directory in (store.sending_dir, store.pending_dir):
+        try:
+            os.unlink(os.path.join(directory, name))
+        except FileNotFoundError:
+            pass
+
+
 def _send_merged_group(store, baseurl, token, counts, members):
-    """把一组连发文本任务合并成一条 sendmessage 发出（机械合并兜底）。
+    """Persist the complete envelope BEFORE sending; never split after a send.
 
-    members 已按 enqueued_at 升序；用最新成员的 context_token 发送，
-    合并发送只等一次任务间 pacing，token 额度按实际送达的分片数计
-    （审查第 5 项，不再按任务数低估）。
-
-    失败语义：
-    - 合并整条未送达（失败响应且已送达分片为 0，或发送抛异常）：降级为
-      逐条发送（成员已认领，逐个走 _deliver_claimed，各自记 attempts/
-      退避或进 sent/）——一条毒任务不拖全组，下一轮起它们也不再合并。
-      合并尝试本身不单独给成员记 attempts。
-    - 长文本分片部分送达（0<done<total）：已达分片绝不重发——未达部分
-      收拢为最新成员文件上的续发任务（text=合并全文、chunks_done=done），
-      其余成员标记 merged_into 后进 sent/。
-    - token 失效（-14）：走既有探活流程，不降级。
-    返回 False 仅当 token 确认失效（探活也 -14）。
+    Even a read timeout may follow server acceptance. Retrying a stable batch
+    preserves both its text and client ID; member aliases are never deliveries.
     """
     newest = members[-1]
     name = newest["name"]
-    names = ", ".join(m["name"] for m in members)
-    token_used = newest["job"].get("context_token") or ""
-    to_user_id = newest["job"].get("to_user_id") or ""
-    # P3(b)：额度复检（合并发送计 1 条）
-    if counts.get(token_used, 0) >= TOKEN_SEND_CAP:
-        log("context_token 发送额度已满 (%d)，合并组留队等新 token"
-            % TOKEN_SEND_CAP, job=name)
-        return True
-    # 认领整组；任一成员认领失败则已认领的放回，整组本轮跳过
     claimed = []
-    for m in members:
-        try:
-            os.replace(m["pending_path"], m["sending_path"])
-            claimed.append(m)
-        except (FileNotFoundError, OSError) as e:
-            log("合并组成员认领失败 (%s)，整组本轮跳过: %s" % (e, names),
-                job=m["name"])
-            for cm in claimed:
-                try:
-                    os.replace(cm["sending_path"], cm["pending_path"])
-                except OSError:
-                    pass
-            return True
-
-    merged_text = "\n\n".join((m["job"].get("text") or "") for m in members)
-    log("合并发送 %d 条任务为一条: %s" % (len(members), names), job=name)
-    for m in members:
-        m["job"]["delivery_state"] = "inflight"
-        try:
-            atomic_write_json(m["sending_path"], m["job"])
-        except OSError:
-            pass
-    resp = None
-    send_err = None
-    chunk_progress = {"done": 0, "total": 0}
-
-    def _note_chunk(done, total):
-        chunk_progress["done"] = done
-        chunk_progress["total"] = total
-        _touch_flusher_heartbeat(store)
-
     try:
-        resp = send_message(baseurl, token, to_user_id, merged_text, token_used,
-                            on_chunk=_note_chunk,
-                            client_key="merged:" + name, pace=PACE_SECONDS)
-    except Exception as e:
-        send_err = e
-        # 审查第 3 项：异常路径也要拿回已送达片数
-        chunk_progress["done"] = int(getattr(e, "_chunks_done", 0) or 0)
-        chunk_progress["total"] = int(getattr(e, "_chunks_total", 0) or 0)
-
-    if resp is not None and is_token_invalid(resp):
-        # P4：先探活，探活也 -14 才判失效（与单发一致，不降级）
-        if probe_token_invalid(store, baseurl, token):
-            mark_needs_relogin(store, "sendmessage -14 且探活 -14，token 确认失效")
-            log("token 确认失效，已写 NEEDS_RELOGIN，合并组留队", job=name)
-            for m in members:
-                m["job"]["next_attempt_at"] = 0
-                _return_to_pending(store, m["sending_path"],
-                                   m["pending_path"], m["job"])
-            return False
-        log("合并发送返回 -14 但探活正常，按可重试失败处理",
-            job=name, attempt=1)
-        resp = {"ret": -14, "errmsg": "send -14, probe ok"}
-
-    if resp is not None and resp_ok(resp):
-        for m in members:
-            _mark_sent(store, m["sending_path"], m["name"])
-        # 审查第 5 项：额度按实际送达的分片数计，不再按任务数低估
-        _total = int(resp.get("_chunks_total") or 0) if isinstance(resp, dict) else 0
-        counts[token_used] = counts.get(token_used, 0) + max(1, _total)
-        log("已发送合并回复（%d 条合一）: %s" % (len(members), names),
-            job=name, attempt=1)
-        if PACE_SECONDS > 0:
-            time.sleep(PACE_SECONDS)
-        return True
-
-    done = int(resp.get("_chunks_done") or 0) if isinstance(resp, dict) else 0
-    total = int(resp.get("_chunks_total") or 0) if isinstance(resp, dict) else 0
-    if send_err is not None:
-        done, total = chunk_progress["done"], chunk_progress["total"]
-    if resp is not None and total > 1 and 0 < done < total:
-        # 分片部分送达：收拢续发，其余成员标记后进 sent/，已达分片不重发
-        reason = "发送返回异常: %s" % str(resp)[:200]
-        cont = newest["job"]
-        cont["text"] = merged_text
-        cont["chunks_done"] = done
-        cont["attempts"] = 1
-        cont["last_error"] = reason + "（合并分片部分送达，续发）"
-        cont["next_attempt_at"] = time.time() + BACKOFFS[0]
-        cont["merged_from"] = [m["name"] for m in members]
-        _return_to_pending(store, newest["sending_path"],
-                           newest["pending_path"], cont)
-        for m in members[:-1]:
-            mj = dict(m["job"])
-            mj["merged_into"] = name
-            atomic_write_json(os.path.join(store.sent_dir, m["name"]), mj)
+        for member in members:
+            os.replace(member["pending_path"], member["sending_path"])
+            claimed.append(member)
+    except OSError:
+        for member in claimed:
             try:
-                os.unlink(m["sending_path"])
+                os.replace(member["sending_path"], member["pending_path"])
             except OSError:
                 pass
-        log("合并发送部分送达 %d/%d 片，余下收拢为 %s 续发"
-            % (done, total, name), job=name, attempt=1)
         return True
-
-    # 合并整条未送达：降级逐条发送（成员都已认领，attempts 从 0 起算）
-    if send_err is not None:
-        log("合并发送异常 (%s)，降级逐条发送: %s" % (send_err, names), job=name)
-    else:
-        log("合并发送未送达 (%s)，降级逐条发送: %s"
-            % (str(resp)[:120], names), job=name)
-    for idx, m in enumerate(members):
-        ok = _deliver_claimed(store, baseurl, token, counts, m["name"],
-                              m["job"], m["sending_path"], m["pending_path"],
-                              m["enq"], 0)
-        if not ok:
-            # 中途确认 token 失效：未轮到的成员原样放回 pending
-            for rest in members[idx + 1:]:
-                rest["job"]["next_attempt_at"] = 0
-                _return_to_pending(store, rest["sending_path"],
-                                   rest["pending_path"], rest["job"])
-            return False
-    return True
+    envelope = dict(newest["job"])
+    envelope["text"] = "\n\n".join(m["job"].get("text", "") for m in members)
+    envelope["client_key"] = "merged:" + name
+    envelope["merged_from"] = [m["name"] for m in members]
+    covers = []
+    for member in members:
+        ids = member["job"].get("covers_message_ids") or [member["job"].get("message_id")]
+        for mid in ids:
+            if mid is not None and str(mid) not in covers:
+                covers.append(str(mid))
+    envelope["covers_message_ids"] = covers
+    envelope["enqueued_at"] = min(m["enq"] for m in members)
+    envelope["delivery_state"] = "prepared"
+    # A crash at any following point can discover this manifest and suppress
+    # the remaining original members, even before their aliases were written.
+    atomic_write_json(newest["sending_path"], envelope)
+    for member in members[:-1]:
+        _archive_merge_member(store, member["name"], member["job"], name)
+    log("prepared durable merged reply (%d members)" % len(members), job=name)
+    return _deliver_claimed(store, baseurl, token, counts, name, envelope,
+                            newest["sending_path"], newest["pending_path"],
+                            envelope["enqueued_at"], int(envelope.get("attempts", 0)))
 
 
 def flush_outbox(store, baseurl, token):
@@ -759,18 +772,26 @@ def flush_outbox(store, baseurl, token):
     其余任务逐条发。返回 False 仅当确认 token 失效，run() 据此退出 serve；
     其余异常都逐单元吞掉记日志，绝不向上抛。
     """
+    _recover_sending(store)
     counts = _token_counts(store)
     last_ctx = load_json(store.last_ctx_path) or {}
+    if not isinstance(last_ctx, dict):
+        last_ctx = {}
+    session = load_json(store.session_path) or {}
+    owner = session.get("ilink_user_id") if isinstance(session, dict) else None
     now = time.time()
 
     # —— 预处理：逐任务定性，不产生发送副作用 ——
     candidates = []
+    blocked_users = set()
     for enq, name, job in _list_pending(store):
         pending_path = os.path.join(store.pending_dir, name)
         sending_path = os.path.join(store.sending_dir, name)
         try:
             job["enqueued_at"] = enq
             attempts = int(job.get("attempts") or 0)
+            if job.get("to_user_id") in blocked_users:
+                continue
             # P1：次数/年龄到顶 → 死信
             if attempts >= MAX_ATTEMPTS or (now - enq) > MAX_JOB_AGE:
                 try:
@@ -782,6 +803,7 @@ def flush_outbox(store, baseurl, token):
                 continue
             # P1：退避未到点，跳过不试
             if float(job.get("next_attempt_at") or 0) > now:
+                blocked_users.add(job.get("to_user_id"))
                 continue
             # 内容校验：无效任务直接死信，不陪跑
             to_user_id = job.get("to_user_id") or ""
@@ -794,12 +816,17 @@ def flush_outbox(store, baseurl, token):
                           "任务无效：缺 to_user_id 或内容为空")
                 continue
             # P3(c)：未尝试过的任务，若有更新的同用户 token 则升级
-            if attempts == 0:
+            if attempts == 0 or job.get("budget_deferred"):
                 new_tok = last_ctx.get("context_token") or ""
                 if (new_tok and last_ctx.get("to_user_id") == to_user_id
                         and new_tok != (job.get("context_token") or "")):
                     job["context_token"] = new_tok
+                    job.pop("budget_deferred", None)
                     log("任务升级到最新 context_token", job=name)
+            if owner and to_user_id != owner:
+                os.replace(pending_path, sending_path)
+                _fail_job(store, sending_path, name, job, "recipient differs from logged-in owner")
+                continue
             candidates.append({"enq": enq, "name": name, "job": job,
                                "pending_path": pending_path,
                                "sending_path": sending_path})
@@ -837,8 +864,12 @@ def flush_outbox(store, baseurl, token):
     units.sort(key=lambda u: u[0])
 
     # —— 逐单元发送 ——
+    blocked_users = set()
     for _anchor, members in units:
         newest = members[-1]
+        recipient = newest["job"].get("to_user_id")
+        if recipient in blocked_users:
+            continue
         # P1-1：每个发送单元开头刷新心跳——一轮 flush 里排了很多任务时，
         # 轮与轮之间可能隔很久，单元级刷新保证健康线程的心跳不假过期。
         _touch_flusher_heartbeat(store)
@@ -854,13 +885,18 @@ def flush_outbox(store, baseurl, token):
                         % (MERGE_FRESH_SECONDS,
                            ", ".join(m["name"] for m in members)),
                         job=newest["name"])
+                    blocked_users.add(recipient)
                     continue
                 if not _send_merged_group(store, baseurl, token, counts, members):
                     return False
             else:
                 if not _send_single(store, baseurl, token, counts, members[0]):
                     return False
+            if any(os.path.exists(m["pending_path"]) or os.path.exists(m["sending_path"])
+                   for m in members):
+                blocked_users.add(recipient)
         except Exception as e:
+            blocked_users.add(recipient)
             log("发送单元未预期异常（已隔离）: %s" % e, job=newest["name"])
     return True
 
@@ -877,33 +913,75 @@ def _acquire_lock(store):
 
 
 def _recover_sending(store):
-    """启动回收（审查第 1 项）：把 sending/ 里滞留的任务全量移回 pending。
-
-    任务被认领进 sending/ 后若 serve 中途被杀（崩溃/VM 替换/人工 kill），
-    旧实现里它就永久卡在 sending/——不重发、不死信、status 还不显示。
-    run() 在拿到 flock（独占性有保证）之后、开始轮询之前调用本函数：
-    文件级移动，保留 attempts/enqueued_at/chunks_done；next_attempt_at
-    一律清零立即重试（崩溃前可能正卡在长退避里，回收后没必要再等）。
-    """
+    """Recover only between flush cycles, preserving canonical merge identity."""
     try:
-        names = [f for f in os.listdir(store.sending_dir) if f.endswith(".json")]
+        names = [n for n in os.listdir(store.sending_dir) if n.endswith(".json")]
     except OSError:
         return
-    for name in names:
+    if not names:
+        return
+    records = {}
+    anchors = {}
+    for directory in (store.sent_dir, store.failed_dir, store.pending_dir, store.sending_dir):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                job = load_json(os.path.join(directory, name))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(job, dict):
+                continue
+            records[name] = job
+            members = job.get("merged_from")
+            if isinstance(members, list) and job.get("client_key"):
+                for member in members:
+                    if isinstance(member, str) and member != name:
+                        anchors[member] = name
+    # Resolve member aliases first, while canonical envelopes still exist.
+    for name in sorted(names, key=lambda n: n not in anchors):
         src = os.path.join(store.sending_dir, name)
         dst = os.path.join(store.pending_dir, name)
         try:
             job = load_json(src)
-            if isinstance(job, dict):
-                job["next_attempt_at"] = 0
-                job["delivery_state"] = "recovered"
-                atomic_write_json(dst, job)
-                os.unlink(src)
-            else:
+            if not isinstance(job, dict):
                 os.replace(src, dst)
-            log("启动回收：sending/ 滞留任务已移回 pending", job=name)
-        except OSError as e:
-            log("启动回收 sending/ 任务失败: %s" % e, job=name)
+                continue
+            anchor = anchors.get(name) or job.get("merged_into")
+            if anchor:
+                if anchor not in records:
+                    _fail_job(store, src, name, job, "missing canonical merge envelope; manual review required")
+                else:
+                    _archive_merge_member(store, name, job, anchor)
+                continue
+            if (os.path.exists(os.path.join(store.sent_dir, name)) or
+                    os.path.exists(os.path.join(store.failed_dir, name))):
+                # Sent transition already committed, only old source cleanup
+                # failed. Never resurrect a committed completed identity.
+                os.unlink(src)
+                continue
+            existing = load_json(dst)
+            if isinstance(existing, dict) and existing.get("client_key") == job.get("client_key"):
+                if any(existing.get(k) != job.get(k) for k in ("text", "media_path", "to_user_id")):
+                    log("conflicting delivery copies require manual review", job=name)
+                    continue
+                pending = dict(existing)
+                pending["chunks_done"] = max(int(existing.get("chunks_done") or 0), int(job.get("chunks_done") or 0))
+                pending["attempts"] = max(int(existing.get("attempts") or 0), int(job.get("attempts") or 0))
+                pending["next_attempt_at"] = max(float(existing.get("next_attempt_at") or 0), float(job.get("next_attempt_at") or 0))
+                job = pending
+            else:
+                job.setdefault("next_attempt_at", 0)
+            job["delivery_state"] = "recovered"
+            atomic_write_json(dst, job)
+            os.unlink(src)
+            log("recovered interrupted delivery", job=name)
+        except (OSError, ValueError, TypeError) as error:
+            log("delivery recovery pending: %s" % error, job=name)
 
 
 def _poll_response_bad(resp):
@@ -949,8 +1027,15 @@ def run(store, baseurl, token, owner_id):
       serve 进程活着但心跳 >120s 未更新时按宕机杀进程重拉，覆盖
       「线程卡在无超时路径上、is_alive 仍为真」的情况。
     """
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        log("机主 ID 缺失，serve 拒绝启动；请重新确认登录会话")
+        return 1
     if not _acquire_lock(store):
         log("serve 已有实例在运行（锁被占用），本实例退出")
+        return 1
+    current = load_json(store.session_path)
+    if isinstance(current, dict) and (current.get("bot_token") != token or current.get("ilink_user_id") != owner_id):
+        log("session changed before service lock; restart with current credentials")
         return 1
     # 审查第 1 项：独占锁已拿到，先回收上次进程滞留在 sending/ 的任务
     _recover_sending(store)
@@ -1019,8 +1104,8 @@ def run(store, baseurl, token, owner_id):
             except Exception as e:
                 consec_failures += 1
                 delay = 30 if consec_failures >= 3 else 2
-                log("getupdates 出错，%d 秒后重试 (连续失败 %d 次): %s"
-                    % (delay, consec_failures, e))
+                log("getupdates 出错，%d 秒后重试 (连续失败 %d 次，%s)"
+                    % (delay, consec_failures, type(e).__name__))
                 time.sleep(delay)
                 continue
             # 审查第 6 项：先判形状再取字段（旧实现先 .get 后判 dict，
@@ -1029,11 +1114,10 @@ def run(store, baseurl, token, owner_id):
             if _poll_response_bad(resp) and not is_token_invalid(resp):
                 consec_failures += 1
                 delay = 30 if consec_failures >= 3 else 2
-                log("getupdates 返回异常响应，%d 秒后重试 (连续失败 %d 次): %s"
-                    % (delay, consec_failures, str(resp)[:200]))
+                log("getupdates 返回异常响应，%d 秒后重试 (连续失败 %d 次)"
+                    % (delay, consec_failures))
                 time.sleep(delay)
                 continue
-            consec_failures = 0
             try:
                 suggested = int(resp.get("longpolling_timeout_ms") or 0)
                 if suggested > 0:
@@ -1058,19 +1142,41 @@ def run(store, baseurl, token, owner_id):
             # 任一消息记录落盘失败（handle_incoming 返回 False 或抛出
             # 未被它兜住的异常），本批不保存游标，消息下轮重新投递。
             batch_ok = True
-            for msg in resp.get("msgs") or []:
+            messages = resp.get("msgs")
+            if messages is None:
+                messages = []
+            elif not isinstance(messages, list):
+                # A schema-invalid batch is acknowledged only after its raw
+                # contents are durably quarantined and a visible status exists.
+                batch_ok = _quarantine_incoming(store, resp, "msgs_not_array")
+                messages = []
+            for msg in messages:
                 try:
                     if handle_incoming(store, msg, owner_id) is False:
                         batch_ok = False
-                        log("消息记录落盘失败，本批游标不推进: [%s]"
-                            % msg.get("message_id"))
+                        log("消息记录落盘失败，本批游标不推进")
                 except Exception as e:
                     batch_ok = False
-                    log("处理消息出错，本批游标不推进: %s" % e)
+                    log("处理消息出错，本批游标不推进（%s）" % type(e).__name__)
             new_buf = resp.get("get_updates_buf")
-            if new_buf and batch_ok:
-                buf = new_buf
-                atomic_write_text(store.buf_path, buf)
+            if new_buf is not None and not isinstance(new_buf, str):
+                _quarantine_incoming(store, resp, "cursor_not_string")
+                batch_ok = False  # There is no safe usable cursor to advance to.
+            if batch_ok and new_buf:
+                try:
+                    atomic_write_text(store.buf_path, new_buf)
+                    buf = new_buf  # Never advance in memory before persistence.
+                except Exception as e:
+                    batch_ok = False
+                    log("写入轮询游标失败，保留旧游标（%s）" % type(e).__name__)
+            if not batch_ok:
+                consec_failures += 1
+                delay = 30 if consec_failures >= 3 else 2
+                log("本批尚未安全接收，%d 秒后重试 (连续失败 %d 次)"
+                    % (delay, consec_failures))
+                time.sleep(delay)
+                continue
+            consec_failures = 0
             # 提速 A：发送已拆给 flusher 线程，主循环不再调用 flush。
     except KeyboardInterrupt:
         log("收到中断，退出 serve。")
