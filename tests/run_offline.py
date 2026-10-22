@@ -12,7 +12,7 @@ SUITES = [
     'test_crypto.py', 'test_p1p7.py', 'test_merge.py', 'test_speed.py',
     'test_audit2fix.py', 'test_audit12.py', 'test_receiver_hardening.py',
     'test_media_login_hardening.py', 'test_delivery_hardening.py',
-    'test_worker_state.py',
+    'test_worker_state.py', 'test_burst_ownership.py', 'test_latency_trace.py',
 ]
 GUARD = '''import os, runpy, socket, sys, tempfile
 from pathlib import Path

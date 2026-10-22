@@ -34,7 +34,7 @@ class WorkerStateTests(unittest.TestCase):
     def test_claim_is_unique_under_concurrent_workers(self):
         self.incoming("201")
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda lease: self.state.claim(["201"], lease), ["a", "b"]))
+            results = list(pool.map(lambda _: self.state.claim(["201"]), range(2)))
         self.assertEqual(sum(len(r["claimed"]) for r in results), 1)
         self.assertTrue((self.state.started / "201.started").exists())
 
@@ -42,7 +42,7 @@ class WorkerStateTests(unittest.TestCase):
         self.incoming("202")
         with ThreadPoolExecutor(max_workers=2) as pool:
             hook = pool.submit(self.state.plan)
-            worker = pool.submit(self.state.claim, ["202"], "worker")
+            worker = pool.submit(self.state.claim, ["202"])
             planned, claimed = hook.result(), worker.result()
         selected = planned["payload"].get("message_ids", [])
         self.assertEqual(len(selected) + len(claimed["claimed"]), 1)
@@ -56,10 +56,10 @@ class WorkerStateTests(unittest.TestCase):
     def test_supplement_gets_started_marker_and_same_owner(self):
         self.incoming("1")
         self.incoming("2")
-        first = self.state.claim(["1"], "batch")
+        first = self.state.claim(["1"])
         extra = self.state.claim(["2"], first["lease"])
         self.assertEqual(extra["claimed"], ["2"])
-        self.now += 181
+        self.now += 89
         self.assertEqual(self.state.plan()["decision"], "silent")
 
     def test_rewake_only_adopt_and_old_lease_rejected(self):
@@ -83,13 +83,13 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(duplicate["owned"], [])
         self.state.enqueue_reply(["3"], "test-owner", "x", "one reply", first["lease"])
 
-    def test_started_threshold_still_700_seconds(self):
+    def test_started_worker_expires_after_90_seconds(self):
         self.incoming("4")
         payload = self.state.plan()["payload"]
         self.state.adopt(["4"], payload["lease"])
         marker = self.state.started / "4.started"
         os.utime(marker, (self.now, self.now))
-        self.now += 699
+        self.now += 89
         self.assertEqual(self.state.plan()["decision"], "silent")
         self.now += 1
         self.assertEqual(self.state.plan()["payload"]["message_ids"], ["4"])
@@ -118,7 +118,7 @@ class WorkerStateTests(unittest.TestCase):
     def test_enqueue_covers_entire_batch_and_completes_receipts(self):
         for mid in ("a", "b"):
             self.incoming(mid)
-        lease = self.state.claim(["a", "b"], "batch")["lease"]
+        lease = self.state.claim(["a", "b"])["lease"]
         result = self.state.enqueue_reply(["a", "b"], "test-owner", "synthetic", "reply", lease)
         job = load_json(str(self.base / "outbox/pending/b.json"))
         self.assertEqual(job["covers_message_ids"], ["a", "b"])
@@ -132,8 +132,8 @@ class WorkerStateTests(unittest.TestCase):
         self.incoming("media")
         media = self.home / "synthetic.png"
         media.write_bytes(b"synthetic media, no upload")
-        self.state.claim(["media"], "batch")
-        result = self.state.enqueue_reply(["media"], "test-owner", "ctx", "caption", "batch", str(media))
+        lease = self.state.claim(["media"])["lease"]
+        result = self.state.enqueue_reply(["media"], "test-owner", "ctx", "caption", lease, str(media))
         queued = self.base / "outbox/pending/media.json"
         job = load_json(str(queued))
         self.assertEqual(job["media_path"], str(media.resolve()))
@@ -150,12 +150,12 @@ class WorkerStateTests(unittest.TestCase):
         self.incoming("media")
         media = self.home / "synthetic.pdf"
         media.write_bytes(b"synthetic file, no upload")
-        self.state.claim(["media"], "batch")
+        lease = self.state.claim(["media"])["lease"]
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
         result = subprocess.run([sys.executable, "-m", "wechat_bridge.worker_state",
                                  "--base", str(self.base), "--state-dir", str(self.state_dir),
                                  "enqueue-reply", "--ids", "media", "--to", "test-owner",
-                                 "--context=synthetic", "--lease", "batch", "--media-path", str(media)],
+                                 "--context=synthetic", "--lease", lease, "--media-path", str(media)],
                                 env=env, capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         job = load_json(str(self.base / "outbox/pending/media.json"))
@@ -167,7 +167,7 @@ class WorkerStateTests(unittest.TestCase):
         self.incoming("media")
         media = self.home / "synthetic.png"
         media.write_bytes(b"synthetic media, no upload")
-        self.state.claim(["media"], "batch")
+        lease = self.state.claim(["media"])["lease"]
         calls = [0]
         def failing(path, obj):
             calls[0] += 1
@@ -176,7 +176,7 @@ class WorkerStateTests(unittest.TestCase):
             atomic_write_json(path, obj)
         with patch.object(ws, "atomic_write_json", side_effect=failing):
             with self.assertRaises(OSError):
-                self.state.enqueue_reply(["media"], "test-owner", "ctx", "caption", "batch", str(media))
+                self.state.enqueue_reply(["media"], "test-owner", "ctx", "caption", lease, str(media))
         original = load_json(str(self.state.batch_dir / "media.json"))["job"]
         self.state.recover_prepared("media.json")
         recovered = load_json(str(self.base / "outbox/pending/media.json"))
@@ -187,7 +187,7 @@ class WorkerStateTests(unittest.TestCase):
 
     def test_missing_or_nonregular_media_refused_before_state_publication(self):
         self.incoming("media")
-        self.state.claim(["media"], "batch")
+        lease = self.state.claim(["media"])["lease"]
         candidates = [self.home / "missing.png", self.home]
         if hasattr(os, "mkfifo"):
             fifo = self.home / "fifo"
@@ -196,35 +196,35 @@ class WorkerStateTests(unittest.TestCase):
         for path in candidates:
             with self.subTest(path=path.name):
                 with self.assertRaises((ValueError, OSError)):
-                    self.state.enqueue_reply(["media"], "test-owner", "ctx", "", "batch", str(path))
+                    self.state.enqueue_reply(["media"], "test-owner", "ctx", "", lease, str(path))
                 self.assertTrue((self.base / "inbox/media.json").exists())
                 self.assertFalse((self.base / "outbox/pending/media.json").exists())
                 self.assertFalse((self.state.batch_dir / "media.json").exists())
         with self.assertRaises(ValueError):
-            self.state.enqueue_reply(["media"], "test-owner", "ctx", "", "batch")
+            self.state.enqueue_reply(["media"], "test-owner", "ctx", "", lease)
 
     def test_enqueue_rejects_cross_user_and_stale_lease(self):
         self.incoming("a")
-        self.state.claim(["a"], "batch")
+        lease = self.state.claim(["a"])["lease"]
         with self.assertRaises(ValueError):
-            self.state.enqueue_reply(["a"], "other-user", "x", "reply", "batch")
+            self.state.enqueue_reply(["a"], "other-user", "x", "reply", lease)
         with self.assertRaises(ValueError):
             self.state.enqueue_reply(["a"], "test-owner", "x", "reply", "old")
         self.assertEqual(list((self.base / "outbox/pending").glob("*")), [])
 
     def test_second_reply_cannot_overwrite_same_task(self):
         self.incoming("a")
-        self.state.claim(["a"], "batch")
-        self.state.enqueue_reply(["a"], "test-owner", "x", "first", "batch")
+        lease = self.state.claim(["a"])["lease"]
+        self.state.enqueue_reply(["a"], "test-owner", "x", "first", lease)
         with self.assertRaises(ValueError):
-            self.state.enqueue_reply(["a"], "test-owner", "x", "replacement", "batch")
+            self.state.enqueue_reply(["a"], "test-owner", "x", "replacement", lease)
         self.assertEqual(load_json(str(self.base / "outbox/pending/a.json"))["text"], "first")
 
     def test_complete_requires_admitted_reply(self):
         self.incoming("a")
-        self.state.claim(["a"], "batch")
+        lease = self.state.claim(["a"])["lease"]
         with self.assertRaises(ValueError):
-            self.state.complete(["a"], "batch")
+            self.state.complete(["a"], lease)
         self.assertTrue((self.base / "inbox/a.json").exists())
 
     def test_covered_sending_member_no_duplicate_reply(self):
@@ -250,10 +250,10 @@ class WorkerStateTests(unittest.TestCase):
 
     def test_admitted_registry_covers_transient_queue_move(self):
         self.incoming("a")
-        self.state.claim(["a"], "batch")
+        lease = self.state.claim(["a"])["lease"]
         with patch.object(self.state, "_complete", side_effect=RuntimeError("crash before completion")):
             with self.assertRaises(RuntimeError):
-                self.state.enqueue_reply(["a"], "test-owner", "x", "fixed", "batch")
+                self.state.enqueue_reply(["a"], "test-owner", "x", "fixed", lease)
         (self.base / "outbox/pending/a.json").unlink()  # transient queue rename gap
         self.assertEqual(self.state.covered("a")["status"], "queued")
         self.assertEqual(self.state.plan()["decision"], "silent")
@@ -261,7 +261,7 @@ class WorkerStateTests(unittest.TestCase):
 
     def test_prepared_never_published_recovery_preserves_identity(self):
         self.incoming("a")
-        self.state.claim(["a"], "batch")
+        lease = self.state.claim(["a"])["lease"]
         calls = [0]
         def failing(path, obj):
             calls[0] += 1
@@ -270,7 +270,7 @@ class WorkerStateTests(unittest.TestCase):
             atomic_write_json(path, obj)
         with patch.object(ws, "atomic_write_json", side_effect=failing):
             with self.assertRaises(OSError):
-                self.state.enqueue_reply(["a"], "test-owner", "x", "fixed", "batch")
+                self.state.enqueue_reply(["a"], "test-owner", "x", "fixed", lease)
         self.assertEqual(self.state.covered("a")["status"], "uncertain")
         recovered = self.state.recover_prepared("a.json")
         self.assertEqual(recovered["client_key"], "worker:a")
@@ -278,7 +278,7 @@ class WorkerStateTests(unittest.TestCase):
 
     def test_unknown_publication_never_auto_recreated(self):
         self.incoming("a")
-        self.state.claim(["a"], "batch")
+        lease = self.state.claim(["a"])["lease"]
         calls = [0]
         def failing(path, obj):
             calls[0] += 1
@@ -287,15 +287,15 @@ class WorkerStateTests(unittest.TestCase):
             atomic_write_json(path, obj)
         with patch.object(ws, "atomic_write_json", side_effect=failing):
             with self.assertRaises(OSError):
-                self.state.enqueue_reply(["a"], "test-owner", "x", "fixed", "batch")
+                self.state.enqueue_reply(["a"], "test-owner", "x", "fixed", lease)
         with self.assertRaises(ValueError):
             self.state.recover_prepared("a.json")
         self.assertEqual(self.state.plan()["reason"], "wechat_stuck_message")
 
     def test_completed_receipt_blocks_replayed_inbox_after_seen_trim(self):
         self.incoming("201")
-        self.state.claim(["201"], "batch")
-        self.state.enqueue_reply(["201"], "test-owner", "x", "fixed", "batch")
+        lease = self.state.claim(["201"])["lease"]
+        self.state.enqueue_reply(["201"], "test-owner", "x", "fixed", lease)
         self.incoming("201")  # legacy receiver residue/externally restored file
         self.state.seen_path.write_text("201\n" + "\n".join(str(i) for i in range(10000, 15001)) + "\n")
         self.state.prune_seen()
@@ -305,12 +305,12 @@ class WorkerStateTests(unittest.TestCase):
 
     def test_seen_prune_and_complete_share_lock(self):
         self.incoming("new")
-        self.state.claim(["new"], "batch")
+        lease = self.state.claim(["new"])["lease"]
         atomic_write_json(str(self.base / "outbox/pending/new.json"), {"covers_message_ids": ["new"]})
         self.state.seen_path.write_text("\n".join(str(i) for i in range(5001)) + "\n")
         with ThreadPoolExecutor(max_workers=2) as pool:
             pruning = pool.submit(self.state.prune_seen)
-            finishing = pool.submit(self.state.complete, ["new"], "batch")
+            finishing = pool.submit(self.state.complete, ["new"], lease)
             pruning.result()
             finishing.result()
         self.assertIn("new", self.state._seen())
@@ -394,7 +394,7 @@ class WorkerStateTests(unittest.TestCase):
     def test_six_hour_fallback_releases_only_old_lease(self):
         self.incoming("a")
         old = self.state.plan()["payload"]["lease"]
-        self.now += ws.CLAIM_STALE
+        self.now += 21600
         result = self.state.plan()["payload"]
         self.assertEqual(result["message_ids"], ["a"])
         self.assertNotEqual(result["lease"], old)

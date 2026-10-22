@@ -7,7 +7,7 @@ export HOOK_RUNTIME="${HOOK_RUNTIME:-$ROOT/tests/fixtures/hook_runtime.sh}"
 PYTHON="${PYTHON:-python3}"
 if "$PYTHON" "$ROOT/tests/test_worker_state.py" \
   WorkerStateTests.test_rewake_only_adopt_and_old_lease_rejected \
-  WorkerStateTests.test_started_threshold_still_700_seconds \
+  WorkerStateTests.test_started_worker_expires_after_90_seconds \
   WorkerStateTests.test_three_rewakes_then_stuck_notice \
   WorkerStateTests.test_six_hour_fallback_releases_only_old_lease \
   WorkerStateTests.test_deadletter_does_not_consume_new_message_lease \
