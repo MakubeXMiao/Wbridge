@@ -24,9 +24,9 @@
 # 1 步），hook 据此区分两种超时：**无标记** = 唤醒大概率根本没送达
 # （worker 没启动过），首次认领满 REWAKE_FIRST_STALE_SECS（180 秒）
 # 就快速重唤醒（该 180 秒只管首次，之后看 600 秒间隔）；**有标记**
-# = worker 确实在干活，标记未满 STARTED_STALE_SECS（900 秒）绝不
-# 抢活（防两程并行重复回复），满 900 秒才认定它干活途中已死、可
-# 重唤醒。效果：唤醒丢失约 3 分钟自愈，开工后死亡约 15 分钟被接管，
+# = worker 确实在干活，标记未满 STARTED_STALE_SECS（700 秒）绝不
+# 抢活（防两程并行重复回复），满 700 秒才认定它干活途中已死、可
+# 重唤醒。效果：唤醒丢失约 3 分钟自愈，开工后死亡约 12 分钟被接管，
 # 最坏约 33 分钟发出卡死告警（3 分钟首唤 + 两次 10 分钟间隔重唤 +
 # 10 分钟后告警）。
 set -euo pipefail
@@ -46,7 +46,7 @@ REWAKE_FIRST_STALE_SECS=180  # 无已开工标记时，首次认领满 3 分钟�
 REWAKE_INTERVAL_SECS=600     # 两次重唤醒的最小间隔（首次之后，以及卡死告警的等待）
 REWAKE_MAX=3                 # 同一消息最多重唤醒次数（两条路径合计），用尽后转卡死告警
 STARTED_DIR="$STATE_DIR/wechat_worker_started"
-STARTED_STALE_SECS=900       # 已开工标记满 15 分钟：worker 干活途中已死，可重唤醒
+STARTED_STALE_SECS=700       # 已开工标记满约 12 分钟（700 秒）：worker 干活途中已死，可重唤醒（平台 600 秒单程上限 + 约 100 秒余量）
 mkdir -p "$STATE_DIR"
 if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
   mkdir -p "$STARTED_DIR"
@@ -357,7 +357,7 @@ for f in "$BASE"/inbox/*.json; do
           # 调参，规则名会记进日志便于对账）：
           # - 有标记且未满 STARTED_STALE_SECS：worker 正在干活，
           #   不 eligible，绝不抢（防两程并行、重复回复）；
-          # - 有标记且满 900 秒（started-stale-900）：worker 干活途中
+          # - 有标记且满 700 秒（started-stale-700）：worker 干活途中
           #   已死，eligible；
           # - 无标记且从未重唤醒过（no-marker-180）：唤醒大概率丢
           #   失，eligible（首次快速通道，认领满 180 秒即到）；
@@ -373,7 +373,7 @@ for f in "$BASE"/inbox/*.json; do
             marker_ts="$(stat -c %Y "$marker_file" 2>/dev/null || echo 0)"
             case "$marker_ts" in ''|*[!0-9]*) marker_ts=0 ;; esac
             if [ $((now - marker_ts)) -ge "$STARTED_STALE_SECS" ]; then
-              eligible=1; rule="started-stale-900"
+              eligible=1; rule="started-stale-700"
             fi
           elif [ "$rcnt" -eq 0 ]; then
             eligible=1; rule="no-marker-180"

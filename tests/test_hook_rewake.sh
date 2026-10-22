@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # hook 层离线测试（2026-10-22 超时重唤醒兜底 + 同日调参：阈值拆分 +
 # 已开工标记）：无标记的已认领消息满 180 秒未处理 → 快速重唤醒
-# （rule no-marker-180）；有已开工标记则标记未满 900 秒绝不重唤醒、
-# 满 900 秒才按 worker 中途死亡重唤醒（rule started-stale-900）；
+# （rule no-marker-180）；有已开工标记则标记未满 700 秒绝不重唤醒、
+# 满 700 秒才按 worker 中途死亡重唤醒（rule started-stale-700）；
 # 两次重唤醒间隔 ≥600 秒、合计最多 3 次；用尽后恰好一次
 # wechat_stuck_message 告警；dry run 不改任何状态（含标记目录）。
 # 用假 HOME + 假 serve 进程跑真实的 ~/hooks/scripts/wechat-inbox-watch.sh，
@@ -12,6 +12,11 @@
 # 变更注记（调参适配）：旧 R3「新鲜认领 300 秒不重唤醒」在新阈值下
 # 不再成立（300 ≥ 180 会走快速重唤醒），改为 100 秒验证同一语义
 # （低于首次阈值不触发）；300 秒档的行为由 S1（200 秒触发）覆盖。
+# 变更注记（2026-10-22 二次调参）：STARTED_STALE_SECS 900 → 700
+# （平台 600 秒单程上限杀掉挂死 worker 后，旧 900 秒判死会让其标记
+# 多「活」近 5 分钟、延迟接管；700 = 600 上限 + 约 100 秒余量）；
+# 规则名随之改 started-stale-700；新增 S10/S11 边界用例（标记 800
+# 秒触发、650 秒不触发）。
 set -u
 
 REAL_HOME="$HOME"
@@ -151,15 +156,35 @@ out="$(run_hook)"
 ! grep -q "^4012 " "$REWAKE"; check "rewake S3 无状态条目" $?
 [ -f "$STARTED/4012.started" ]; check "rewake S3 有效标记不被孤儿清理误删" $?
 
-# S4：陈旧标记（1000 秒前）+ 认领 2000 秒 → 按中途死亡重唤醒，规则 started-stale-900
+# S4：陈旧标记（1000 秒前）+ 认领 2000 秒 → 按中途死亡重唤醒，规则 started-stale-700
 echo '{}' > "$INBOX/4013.json"
 echo "4013 $(( $(now) - 2000 )) $(( $(now) - 2000 ))" >> "$CLAIM"
 date +%s > "$STARTED/4013.started"
 touch -d "@$(( $(now) - 1000 ))" "$STARTED/4013.started"
 out="$(run_hook)"
 echo "$out" | grep -q '"rewoken_files":\[".*/4013.json"\]'; check "rewake S4 陈旧标记触发重唤醒" $?
-echo "$out" | grep -q '"rewake":"4013:started-stale-900:1"'; check "rewake S4 日志规则为 started-stale-900" $?
+echo "$out" | grep -q '"rewake":"4013:started-stale-700:1"'; check "rewake S4 日志规则为 started-stale-700" $?
 grep -q "^4013 1 " "$REWAKE"; check "rewake S4 状态计数记为 1" $?
+
+# S10：边界——标记 800 秒前（≥700）+ 认领 2000 秒 → 按 700 规则触发
+echo '{}' > "$INBOX/4018.json"
+echo "4018 $(( $(now) - 2000 )) $(( $(now) - 2000 ))" >> "$CLAIM"
+date +%s > "$STARTED/4018.started"
+touch -d "@$(( $(now) - 800 ))" "$STARTED/4018.started"
+out="$(run_hook)"
+echo "$out" | grep -q '"rewoken_files":\[".*/4018.json"\]'; check "rewake S10 标记 800s（≥700）触发重唤醒" $?
+echo "$out" | grep -q '"rewake":"4018:started-stale-700:1"'; check "rewake S10 日志规则为 started-stale-700" $?
+grep -q "^4018 1 " "$REWAKE"; check "rewake S10 状态计数记为 1" $?
+
+# S11：边界——标记 650 秒前（<700）+ 认领 2000 秒 → 不触发（700 秒
+# 余量窗口内仍视为 worker 在处理，不抢活）
+echo '{}' > "$INBOX/4019.json"
+echo "4019 $(( $(now) - 2000 )) $(( $(now) - 2000 ))" >> "$CLAIM"
+date +%s > "$STARTED/4019.started"
+touch -d "@$(( $(now) - 650 ))" "$STARTED/4019.started"
+out="$(run_hook)"
+! echo "$out" | grep -q '4019'; check "rewake S11 标记 650s（<700）不重唤醒" $?
+! grep -q "^4019 " "$REWAKE"; check "rewake S11 无状态条目" $?
 
 # S5：标记在两轮之间出现 → 压制一笔本已满足间隔的重唤醒
 # （4014 已重唤醒 1 次、上次在 700 秒前，无标记时本轮必触发第 2 次）
