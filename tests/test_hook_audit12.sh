@@ -59,7 +59,13 @@ grep -q "^1001 " "$CLAIM"; check "hook S1 认领已登记" $?
 # （2026-10-22 语义更新：首次认领满 600 秒未处理改为「超时重唤醒」，
 # 1000 秒的旧场景现在会以 rewoken_files 重唤醒，见 test_hook_rewake.sh R1；
 # 本例改用 300 秒验证续租不重唤的原语义。）
+# （2026-10-22 二次调参适配：阈值拆分 + 已开工标记后，无标记的 300 秒
+# 认领会走 no-marker-180 快速重唤醒——「worker 在处理中」自此由已开工
+# 标记证明。本例补上新鲜标记，继续验证「在飞 worker 被续租、不重唤」
+# 的原语义；无标记 300 秒的行为见 test_hook_rewake.sh S1（200 秒触发）。）
 echo "1001 $(( $(now) - 300 ))" > "$CLAIM"
+mkdir -p "$FAKE/hooks/state/wechat_worker_started"
+date +%s > "$FAKE/hooks/state/wechat_worker_started/1001.started"
 out="$(run_hook)"
 echo "$out" | grep -q '"decision":"silent"'; check "hook S2 过期租约被续租不重唤" $?
 ts="$(awk '$1==1001 {print $NF}' "$CLAIM" | tail -1)"

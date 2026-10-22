@@ -11,14 +11,24 @@
 # prompt），hook 容忍 worker 追加的行（两字段或三字段皆可）。
 # 超时重唤醒（2026-10-22 事故驱动加）：认领只是租约，唤醒的 worker
 # 执行本身可能丢失（2026-10-22 09:44/09:56 两条消息被认领、唤醒决定
-# 已做出，但执行未落地，消息在 inbox 静默滞留到人工发现）。首次认领
-# 满 REWAKE_STALE_SECS（600 秒）文件还在、未 seen，就当原唤醒已丢，
-# 重新唤醒一次（payload 以 rewoken_files 单列，worker 须先查
-# sent/pending 有无同名任务、防重复回复）；同一消息两次重唤醒至少
-# 间隔 600 秒、最多 3 次，状态记 wechat_inbox_rewake.txt；3 次用尽
-# 再过 600 秒仍没处理，唤醒一次 wechat_stuck_message 让 worker 向
-# 用户报告（同一条只报一次，文件消失后条目自动清、重置）。6 小时
-# 兜底排在重唤醒之后，语义不变。
+# 已做出，但执行未落地，消息在 inbox 静默滞留到人工发现）。文件还在、
+# 未 seen 时，按下面的规则重新唤醒（payload 以 rewoken_files 单列，
+# worker 须先查 sent/pending 有无同名任务、防重复回复）；状态记
+# wechat_inbox_rewake.txt，两次重唤醒至少间隔 REWAKE_INTERVAL_SECS
+# （600 秒）、合计最多 REWAKE_MAX（3）次；用尽再过 600 秒仍没处理，
+# 唤醒一次 wechat_stuck_message 让 worker 向用户报告（同一条只报
+# 一次，文件消失后条目自动清、重置）。6 小时兜底排在重唤醒之后，
+# 语义不变。
+# 阈值拆分 + 已开工标记（2026-10-22 用户拍板调参）：worker 开工前先
+# 为每条消息写标记 wechat_worker_started/<id>.started（见 prompt 第
+# 1 步），hook 据此区分两种超时：**无标记** = 唤醒大概率根本没送达
+# （worker 没启动过），首次认领满 REWAKE_FIRST_STALE_SECS（180 秒）
+# 就快速重唤醒（该 180 秒只管首次，之后看 600 秒间隔）；**有标记**
+# = worker 确实在干活，标记未满 STARTED_STALE_SECS（900 秒）绝不
+# 抢活（防两程并行重复回复），满 900 秒才认定它干活途中已死、可
+# 重唤醒。效果：唤醒丢失约 3 分钟自愈，开工后死亡约 15 分钟被接管，
+# 最坏约 33 分钟发出卡死告警（3 分钟首唤 + 两次 10 分钟间隔重唤 +
+# 10 分钟后告警）。
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -32,9 +42,15 @@ DOWN_NOTIFIED="$STATE_DIR/wechat_serve_down_notified"
 FAILED_NOTIFIED="$STATE_DIR/wechat_failed_notified.txt"
 CLAIM_STALE_SECS=21600   # 6 小时：认领兜底过期（worker 假死时重新唤醒）
 REWAKE="$STATE_DIR/wechat_inbox_rewake.txt"
-REWAKE_STALE_SECS=600    # 首次认领满 10 分钟未处理：视为唤醒丢失，重唤醒
-REWAKE_MAX=3             # 同一消息最多重唤醒次数，用尽后转卡死告警
+REWAKE_FIRST_STALE_SECS=180  # 无已开工标记时，首次认领满 3 分钟未处理：唤醒丢失，快速重唤醒
+REWAKE_INTERVAL_SECS=600     # 两次重唤醒的最小间隔（首次之后，以及卡死告警的等待）
+REWAKE_MAX=3                 # 同一消息最多重唤醒次数（两条路径合计），用尽后转卡死告警
+STARTED_DIR="$STATE_DIR/wechat_worker_started"
+STARTED_STALE_SECS=900       # 已开工标记满 15 分钟：worker 干活途中已死，可重唤醒
 mkdir -p "$STATE_DIR"
+if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
+  mkdir -p "$STARTED_DIR"
+fi
 touch "$SEEN" "$CLAIM" "$FAILED_NOTIFIED"
 
 DRY="${HATCH_HOOK_DRY_RUN:-0}"
@@ -278,6 +294,21 @@ if [ "$DRY" != "1" ]; then
   rm -f "$tmp_claim"
 fi
 
+# 已开工标记孤儿清理：标记对应的 inbox 文件已消失 = 那条消息已处理
+# 完毕（worker 完成时本应按 prompt 第 4 步自己删标记，没删的在这里
+# 兜底清掉），免得陈旧标记残留在目录里。只在非 dry 时做；本脚本的
+# 整程锁已串行化，worker 写标记不持这把锁、但删的只是无 inbox 文件
+# 对应的标记，与 worker 正在处理的消息无关。
+if [ "$DRY" != "1" ] && [ -d "$STARTED_DIR" ]; then
+  for mf in "$STARTED_DIR"/*.started; do
+    [ -e "$mf" ] || continue
+    mid="$(basename "$mf" .started)"
+    if [ ! -f "$BASE/inbox/$mid.json" ]; then
+      rm -f "$mf"
+    fi
+  done
+fi
+
 # 超时重唤醒状态装载：行格式 "id 已重唤醒次数 上次重唤醒ts 已告警0/1"。
 # 装载时顺带清理：inbox 文件已消失（=已处理完）或已 seen 的条目丢弃，
 # 卡死告警状态随之重置。该文件只由本脚本读写，脚本整程锁已串行化，
@@ -321,17 +352,45 @@ for f in "$BASE"/inbox/*.json; do
           if [ -n "${RW_LISTED[$id]:-}" ]; then
             RW_DROP[$id]=1  # 既然按新消息重走，重唤醒状态一并清掉
           fi
-        elif [ "$claim_age" -ge "$REWAKE_STALE_SECS" ]; then
-          # 已认领未满 6 小时但超过重唤醒阈值：原唤醒大概率已丢失
+        elif [ "$claim_age" -ge "$REWAKE_FIRST_STALE_SECS" ]; then
+          # 已认领未满 6 小时：按「已开工标记」区分两种超时（2026-10-22
+          # 调参，规则名会记进日志便于对账）：
+          # - 有标记且未满 STARTED_STALE_SECS：worker 正在干活，
+          #   不 eligible，绝不抢（防两程并行、重复回复）；
+          # - 有标记且满 900 秒（started-stale-900）：worker 干活途中
+          #   已死，eligible；
+          # - 无标记且从未重唤醒过（no-marker-180）：唤醒大概率丢
+          #   失，eligible（首次快速通道，认领满 180 秒即到）；
+          # - 无标记但已重唤醒过（interval-600）：与上次重唤醒间隔
+          #   满 600 秒才 eligible。
+          # eligible 之后再统一过次数/间隔闸：首次（rcnt=0）直接放
+          # 行，后续必须距上次重唤醒 ≥600 秒；次数用尽且间隔已满、
+          # 未告警过 → 转卡死告警。
           rcnt="${RW_CNT[$id]:-0}"; rlast="${RW_LAST[$id]:-0}"; ral="${RW_AL[$id]:-0}"
-          if [ "$rcnt" -lt "$REWAKE_MAX" ]; then
-            if [ "$rlast" -eq 0 ] || [ $((now - rlast)) -ge "$REWAKE_STALE_SECS" ]; then
-              rewake_files+=("$f")
-              RW_FIRE[$id]=1
+          marker_file="$STARTED_DIR/$id.started"
+          eligible=0; rule=""
+          if [ -f "$marker_file" ]; then
+            marker_ts="$(stat -c %Y "$marker_file" 2>/dev/null || echo 0)"
+            case "$marker_ts" in ''|*[!0-9]*) marker_ts=0 ;; esac
+            if [ $((now - marker_ts)) -ge "$STARTED_STALE_SECS" ]; then
+              eligible=1; rule="started-stale-900"
             fi
-          elif [ "$ral" -eq 0 ] && [ $((now - rlast)) -ge "$REWAKE_STALE_SECS" ]; then
-            stuck_files+=("$(basename "$f")")
-            RW_ALERT[$id]=1
+          elif [ "$rcnt" -eq 0 ]; then
+            eligible=1; rule="no-marker-180"
+          elif [ $((now - rlast)) -ge "$REWAKE_INTERVAL_SECS" ]; then
+            eligible=1; rule="interval-600"
+          fi
+          if [ "$eligible" -eq 1 ]; then
+            if [ "$rcnt" -lt "$REWAKE_MAX" ]; then
+              if [ "$rcnt" -eq 0 ] || [ $((now - rlast)) -ge "$REWAKE_INTERVAL_SECS" ]; then
+                rewake_files+=("$f")
+                RW_FIRE[$id]=1
+                log "rewake decision" "{\"rewake\":\"$id:$rule:$((rcnt + 1))\"}"
+              fi
+            elif [ "$ral" -eq 0 ] && [ $((now - rlast)) -ge "$REWAKE_INTERVAL_SECS" ]; then
+              stuck_files+=("$(basename "$f")")
+              RW_ALERT[$id]=1
+            fi
           fi
           continue
         else

@@ -32,16 +32,32 @@
     超过 6 小时文件还在才重新唤醒（原 worker 假死兜底）。认领文件的读写都走
     同目录 `.lock` 的 flock。worker 把 wake 名单之外的消息并入合并回复时，
     必须先按 prompt 里的命令自己补记认领，否则会被下一轮 hook 当新消息再唤醒。
-  - 超时重唤醒（2026-10-22 加，事故驱动）：认领只是租约，唤醒的 worker 执行本身
-    可能丢失。首次认领满 600 秒、文件还在、未 seen → 重新唤醒一次，payload 以
-    `rewoken_files` 与 `files` 单列区分；worker 处理这类文件前必须先查
-    `outbox/sent/` 与 `outbox/pending/` 有无 `<message_id>.json` 或
-    `<message_id>_*.json` 任务（已有回复发出或在排队就只标 seen、删文件，不重复回复）。
-    节流：同一消息两次重唤醒至少间隔 600 秒、最多 3 次，状态记
-    `~/hooks/state/wechat_inbox_rewake.txt`（行格式 `id 次数 上次重唤醒ts 已告警`）。
-    3 次用尽后又过 600 秒仍未处理 → 唤醒一次 `wechat_stuck_message` 让 worker
-    向用户报告（同一条只报一次；文件消失后条目自动清、告警状态重置）。
-    6 小时兜底排在重唤醒之后，语义不变。
+  - 超时重唤醒（2026-10-22 加，事故驱动；同日调参：阈值拆分 + 已开工标记）：
+    认领只是租约，唤醒的 worker 执行本身可能丢失。文件还在、未 seen 时，hook
+    按「已开工标记」区分两种超时重新唤醒，payload 以 `rewoken_files` 与
+    `files` 单列区分，判定规则名（no-marker-180 / started-stale-900 /
+    interval-600）记入 hook 日志便于对账：
+    - **已开工标记**：worker 按 prompt 第 1 步，开工前为每条消息写
+      `~/hooks/state/wechat_worker_started/<id>.started`（内容为开工 epoch），
+      处理完按第 4 步连同 inbox 文件一起删；hook 对无对应 inbox 文件的孤儿
+      标记兜底清理。
+    - **无标记**（唤醒大概率没送达、worker 根本没启动）：首次认领满
+      **180 秒**即快速重唤醒（`REWAKE_FIRST_STALE_SECS`，只管首次）；之后
+      与上次重唤醒间隔满 **600 秒**（`REWAKE_INTERVAL_SECS`）才再唤。
+    - **有标记**（worker 确实在干活）：标记未满 **900 秒**
+      （`STARTED_STALE_SECS`）绝不重唤醒，防两程并行、重复回复；满 900 秒
+      认定它干活途中已死，可重唤醒（同样受间隔与次数闸约束）。
+    - 节流与上限：两次重唤醒至少间隔 600 秒、两条路径合计最多 **3 次**
+      （`REWAKE_MAX`），状态记 `~/hooks/state/wechat_inbox_rewake.txt`（行格式
+      `id 次数 上次重唤醒ts 已告警`）。用尽后又过 600 秒仍未处理 → 唤醒一次
+      `wechat_stuck_message` 让 worker 向用户报告（同一条只报一次；文件消失
+      后条目自动清、告警状态重置）。worker 处理 rewoken 消息前必须先查
+      `outbox/sent/` 与 `outbox/pending/` 有无 `<message_id>.json` 或
+      `<message_id>_*.json` 任务（已有回复发出或在排队就只标 seen、删文件，
+      不重复回复）。6 小时兜底排在重唤醒之后，语义不变。
+    - 恢复时间线（典型）：唤醒丢失 → 约 **3 分钟**自愈；worker 开工后死亡
+      → 约 **15 分钟**被接管；最坏情况（多次重唤醒接连丢失）→ 约 **33
+      分钟**发出卡死告警（3 分钟首唤 + 两次 10 分钟间隔重唤 + 10 分钟后告警）。
   - 事故注记（2026-10-22）：09:44 与 09:56 两条消息被认领、唤醒决定已做出，
     但 worker 执行未落地，消息在 inbox 静默滞留；因认领每轮续租，后续检查
     一直判「处理中」，直到 10:12 人工排查发现后手动补处理（合并回复已发送、
