@@ -13,3 +13,8 @@ hooks/state/
 __pycache__/
 *.egg-info/
 wechat-bridge-backups/
+
+# Local development environments and offline evidence
+.venv/
+.pytest_cache/
+qa-results/
