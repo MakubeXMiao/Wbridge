@@ -7,7 +7,9 @@
 
 import base64
 import hashlib
+import json
 import os
+import re
 import stat
 import tempfile
 import time
@@ -36,7 +38,88 @@ def media_type_from_path(path):
     return ITEM_FILE
 
 
-def download_media(media, aes_key_override=None, dest_path=None):
+def _key_metadata(value, present=None):
+    """Only shape/charset metadata; never a value, digest, prefix or repr."""
+    if isinstance(value, str):
+        data = value.encode("utf-8", "replace")
+        kind, length = "str", len(value)
+    elif isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+        kind, length = "bytes", len(value)
+    else:
+        data = b""
+        kind, length = ("null" if value is None else "invalid_type"), None
+    sample = data[:4097]
+    if not sample:
+        charset = "empty"
+    elif len(data) > 4096:
+        charset = "oversized"
+    elif all(c in b"0123456789abcdefABCDEF" for c in sample):
+        charset = "hex"
+    elif all(c in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-" for c in sample):
+        charset = "base64_charset"
+    elif all(32 <= c < 127 for c in sample):
+        charset = "ascii"
+    else:
+        charset = "non_ascii_or_binary"
+    return {"present": value is not None if present is None else present,
+            "type": kind, "length": length, "byte_length": len(data),
+            "charset": charset}
+
+
+def log_image_item_fields(item):
+    """Bounded identifier-name tree, with all values excluded from output."""
+    fields = []
+    truncated = False
+    private_values = set()
+
+    def collect(value, depth, budget):
+        if depth > 5 or budget[0] <= 0:
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                if budget[0] <= 0:
+                    break
+                budget[0] -= 1
+                collect(child, depth + 1, budget)
+        elif isinstance(value, list):
+            if value:
+                collect(value[0], depth + 1, budget)
+        elif isinstance(value, str) and 0 < len(value) <= 64:
+            private_values.add(value)
+    collect(item, 0, [64])
+
+    def walk(value, path, depth):
+        nonlocal truncated
+        if len(fields) >= 64 or depth > 5:
+            truncated = True
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if len(fields) >= 64:
+                    truncated = True
+                    break
+                safe = (isinstance(key, str) and len(key) <= 64
+                        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                        and key not in private_values)
+                name = key if safe else "<redacted-field>"
+                entry = {"path": path + [name]}
+                if isinstance(key, str) and ("key" in key.lower() or key == "iv"):
+                    entry["key"] = _key_metadata(child, True)
+                fields.append(entry)
+                if isinstance(child, (dict, list)):
+                    walk(child, entry["path"], depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 1:
+                truncated = True
+            if value:
+                walk(value[0], path + ["[]"], depth + 1)
+    walk(item, ["image_item"], 0)
+    log("image_item_fields " + json.dumps(
+        {"fields": fields, "truncated": truncated}, separators=(",", ":")))
+
+
+def download_media(media, aes_key_override=None, dest_path=None, expected_type=None):
     """从微信 CDN 下载并解密媒体文件。
 
     media: dict，含 encrypt_query_param / full_url / aes_key。
@@ -59,28 +142,50 @@ def download_media(media, aes_key_override=None, dest_path=None):
         raise ValueError("media 既无 full_url 也无 encrypt_query_param")
 
     plain = None
-    last_error = None
     # MAX_MEDIA_BYTES 是明文上限；PKCS7 即使整块也增加一个完整块。
     # 这里只界定本地读取边界，不推定微信平台允许更大的上传文件。
     cipher_limit = (MAX_MEDIA_BYTES // 16 + 1) * 16
+    if expected_type == "image":
+        cipher_limit += 16  # A prefixed CBC IV is not part of the plaintext.
     for name, url in urls:
+        diagnostic = {"event": "media_receive", "source": name, "stage": "http",
+                      "bytes": None, "block_aligned": None, "magic": "other",
+                      "keys": {"item.aeskey": _key_metadata(aes_key_override),
+                               "media.aes_key": _key_metadata(media.get("aes_key"), "aes_key" in media)},
+                      "attempted": [], "expected_type": "image" if expected_type == "image" else "generic"}
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = resp.read(cipher_limit + 1)
-            log("下载源 %s: %d 字节" % (name, len(data)))
+            diagnostic.update(bytes=len(data), block_aligned=bool(data) and len(data) % 16 == 0,
+                              magic=crypto.image_magic(data))
             if len(data) > cipher_limit:
                 raise ValueError("媒体密文超过本地大小上限")
-            candidate = _decrypt_media(data, media, aes_key_override)
+            diagnostic["stage"] = "decrypt"
+            if expected_type == "image" and crypto.image_magic(data) != "other":
+                candidate, strategy = data, "plaintext-image"
+                diagnostic["attempted"].append(strategy)
+            else:
+                candidate, strategy = _decrypt_media(
+                    data, media, aes_key_override, expected_type,
+                    diagnostic["attempted"])
             if len(candidate) > MAX_MEDIA_BYTES:
                 raise ValueError("媒体明文超过 100MB 上限")
+            diagnostic.update(outcome="success", strategy=strategy,
+                              plaintext_magic=crypto.image_magic(candidate))
+            log("media_receive " + json.dumps(diagnostic, separators=(",", ":")))
             plain = candidate
             break  # 完整下载、解密及大小校验成功后才认定此源成功
         except Exception as e:
-            last_error = e
-            log("下载源 %s 失败: %s" % (name, e))
+            # HTTPError/URLError/Request exception text can contain the entire
+            # signed URL. Only fixed classifications may leave this function.
+            error = "http_failed" if diagnostic["stage"] == "http" else "decrypt_or_size_failed"
+            diagnostic.update(outcome="failed", error=error)
+            if isinstance(e, urllib.error.HTTPError) and isinstance(e.code, int):
+                diagnostic["http_status"] = e.code
+            log("media_receive " + json.dumps(diagnostic, separators=(",", ":")))
     if plain is None:
-        raise ValueError("所有下载源均失败: %s" % last_error)
+        raise ValueError("media_receive_all_sources_failed") from None
 
     dest_path = os.fspath(dest_path)
     directory = os.path.dirname(os.path.abspath(dest_path))
@@ -99,31 +204,38 @@ def download_media(media, aes_key_override=None, dest_path=None):
     return dest_path
 
 
-def _decrypt_media(encrypted, media, aes_key_override):
+def _decrypt_media(encrypted, media, aes_key_override, expected_type=None, attempted=None):
     """旧字段密钥无效/解密失败时，仍尝试合法的 media.aes_key。"""
+    if attempted is None:
+        attempted = []
+    sources = (("item", aes_key_override), ("media", media.get("aes_key")))
     candidates = []
-    for source in (aes_key_override, media.get("aes_key") or ""):
+    for label, source in sources:
+        if expected_type == "image" and (not isinstance(source, (str, bytes, bytearray))
+                                         or len(source) > 4096):
+            continue
         try:
             key = crypto.parse_aes_key(source)
         except (ValueError, TypeError):
             continue
-        if key not in candidates:
-            candidates.append(key)
-    last_error = None
-    for key in candidates:
+        if key not in [value for _, value in candidates]:
+            candidates.append((label, key))
+    for label, key in candidates:
+        attempted.append(label + ":parsed-ECB")
         try:
-            return crypto._aes_ecb_decrypt(encrypted, key)
-        except (ValueError, IndexError) as error:
-            last_error = error
-    raw_key = media.get("aes_key") or ""
-    if not isinstance(raw_key, (str, bytes)):
-        raw_key = ""
-    override = candidates[0] if candidates else None
-    plain, strategy = crypto.try_decrypt_variants(encrypted, raw_key, override)
-    if plain is not None:
-        log("解密成功，策略: %s" % strategy)
-        return plain
-    raise ValueError("媒体密钥或密文无效: %s" % (last_error or "无合法密钥"))
+            plain = crypto._aes_ecb_decrypt(encrypted, key)
+            if expected_type != "image" or crypto.image_magic(plain) != "other":
+                return plain, label + ":parsed-ECB"
+        except (ValueError, IndexError):
+            pass
+    for label, raw_key in sources:
+        names = []
+        plain, strategy = crypto.try_decrypt_variants(
+            encrypted, raw_key, expected_type=expected_type, attempted=names)
+        attempted.extend(label + ":" + name for name in names)
+        if plain is not None:
+            return plain, label + ":" + strategy
+    raise ValueError("media_decrypt_failed")
 
 
 def _get_upload_target(baseurl, token, to_user_id, data, encrypted,

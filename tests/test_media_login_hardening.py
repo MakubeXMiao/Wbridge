@@ -1,7 +1,9 @@
 """真实 AES、假 HTTP、临时状态：媒体边界/登录隔离回归。"""
 import argparse
+import base64
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -14,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from wechat_bridge import cli, crypto, ilink, media
+from wechat_bridge import cli, crypto, ilink, media, serve
 from wechat_bridge.store import Store, atomic_write_json, load_json
 from wechat_bridge.worker_state import WorkerState
 
@@ -276,6 +278,221 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(code, "FAKE-QR")
         self.assertTrue(qrpath.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual(saved[0]["qrcode"], "FAKE-QR")
+
+
+class ImageReceiveDiagnostics(unittest.TestCase):
+    """Synthetic bytes only; no credentials, CDN or running service."""
+    PNG = b"\x89PNG\r\n\x1a\n" + b"synthetic-image-body" * 2
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="wechat-image-diagnostic-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / "received.jpg"
+        self.logs = []
+        for guard in (patch.object(media, "log", self.logs.append),
+                      patch.object(serve, "log", self.logs.append)):
+            guard.start()
+            self.addCleanup(guard.stop)
+        for name in ("socket.connect", "socket.connect_ex", "create_connection", "getaddrinfo"):
+            guard = patch("socket." + name, side_effect=AssertionError("Real network forbidden"))
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def download(self, body, raw_key=KEY, nested_key=None, **kwargs):
+        reference = {"full_url": "https://cdn.invalid/PRIVATE-URL?secret=PRIVATE-QUERY"}
+        if nested_key is not None:
+            reference["aes_key"] = nested_key
+        with patch.object(media.urllib.request, "urlopen", return_value=Response(body)):
+            media.download_media(reference, raw_key, str(self.path), expected_type="image", **kwargs)
+        return self.path.read_bytes()
+
+    def diagnostics(self):
+        return [json.loads(line.split(" ", 1)[1]) for line in self.logs
+                if line.startswith("media_receive ")]
+
+    def cbc(self, plain, key, iv):
+        from Crypto.Cipher import AES
+        pad = 16 - len(plain) % 16
+        return AES.new(key, AES.MODE_CBC, iv=iv).encrypt(plain + bytes([pad]) * pad)
+
+    def test_image_magic_categories_and_near_misses(self):
+        cases = [(b"\xff\xd8\xffx", "JPEG"), (self.PNG, "PNG"),
+                 (b"GIF87a...", "GIF"), (b"GIF89a...", "GIF"),
+                 (b"RIFF\x10\x00\x00\x00WEBP...", "WEBP"),
+                 (b"RIFF....WAVE", "other"), (b"\xff\xd8x", "other"),
+                 (b"\x89PNG", "other"), (b"\x00" * 32, "other")]
+        for value, expected in cases:
+            self.assertEqual(crypto.image_magic(value), expected)
+
+    def test_plaintext_images_need_no_key_and_may_be_unaligned(self):
+        for body in (b"\xff\xd8\xffplain", self.PNG, b"GIF89aplain",
+                     b"RIFF....WEBPplain"):
+            with self.subTest(category=crypto.image_magic(body)):
+                self.assertEqual(self.download(body, raw_key=None), body)
+                event = self.diagnostics()[-1]
+                self.assertEqual(event["strategy"], "plaintext-image")
+                self.assertEqual(event["bytes"], len(body))
+                self.assertEqual(event["block_aligned"], len(body) % 16 == 0)
+
+    def test_image_requires_magic_as_well_as_padding(self):
+        for plain in (b"not-an-image", b"\x00" * 24,
+                      b"\x00\x00\x00\x20ftypisom", b"\xff\xd8short"):
+            with self.subTest(plain_class="synthetic-negative"):
+                with self.assertRaisesRegex(ValueError, "media_receive_all_sources_failed"):
+                    self.download(crypto._aes_ecb_encrypt(plain, KEY))
+        self.assertFalse(self.path.exists())
+
+    def test_encrypted_image_magic_formats(self):
+        for plain in (b"\xff\xd8\xffsynthetic", self.PNG, b"GIF89asynthetic",
+                      b"RIFF....WEBPsynthetic"):
+            self.assertEqual(self.download(crypto._aes_ecb_encrypt(plain, KEY)), plain)
+
+    def test_magic_without_valid_padding_is_rejected(self):
+        from Crypto.Cipher import AES
+        invalid = b"\x89PNG\r\n\x1a\n" + b"x" * 7 + b"\x00"
+        with self.assertRaises(ValueError):
+            self.download(AES.new(KEY, AES.MODE_ECB).encrypt(invalid))
+        self.assertFalse(self.path.exists())
+
+    def test_cbc_prefixed_iv(self):
+        iv = bytes(range(16))
+        self.assertEqual(self.download(iv + self.cbc(self.PNG, KEY, iv)), self.PNG)
+        self.assertIn("CBC-prefix-IV", self.diagnostics()[-1]["strategy"])
+
+    def test_cbc_key_iv(self):
+        self.assertEqual(self.download(self.cbc(self.PNG, KEY, KEY)), self.PNG)
+        self.assertIn("CBC-key", self.diagnostics()[-1]["strategy"])
+
+    def test_cbc_zero_iv_and_aes256_prefix_iv(self):
+        self.assertEqual(self.download(self.cbc(self.PNG, KEY, b"\x00" * 16)), self.PNG)
+        key32 = bytes(range(32))
+        iv = b"p" * 16
+        self.assertEqual(self.download(iv + self.cbc(self.PNG, key32, iv),
+                                       raw_key=base64.b64encode(key32).decode()), self.PNG)
+        self.assertIn("CBC-prefix-IV", self.diagnostics()[-1]["strategy"])
+        self.assertEqual(self.download(self.cbc(self.PNG, key32, key32[:16]),
+                                       raw_key=base64.b64encode(key32).decode()), self.PNG)
+        self.assertIn("CBC-key-first16", self.diagnostics()[-1]["strategy"])
+
+    def test_md5_original_item_string_and_raw_truncation(self):
+        from Crypto.Cipher import AES
+        raw = "  synthetic:原始-key-not-normalized  "
+        self.assertEqual(self.download(crypto._aes_ecb_encrypt(
+            self.PNG, hashlib.md5(raw.encode()).digest()), raw_key=raw), self.PNG)
+        self.assertIn("item:raw-md5-ECB", self.diagnostics()[-1]["strategy"])
+        for count in (16, 32):
+            raw = "synthetic-key-material-with-a-long-prefix:private-suffix"
+            key = raw.encode()[:count]
+            self.assertEqual(self.download(crypto._aes_ecb_encrypt(self.PNG, key), raw_key=raw), self.PNG)
+            self.assertIn("raw-first%d" % count, self.diagnostics()[-1]["strategy"])
+
+    def test_wrong_or_malformed_item_key_falls_back_to_nested_raw(self):
+        raw = "synthetic:nested-unparsed-key"
+        cipher = crypto._aes_ecb_encrypt(self.PNG, hashlib.md5(raw.encode()).digest())
+        self.assertEqual(self.download(cipher, raw_key=b"wrong-key-16byte!", nested_key=raw), self.PNG)
+        self.assertIn("media:raw-md5", self.diagnostics()[-1]["strategy"])
+
+    def test_parsed_padding_only_result_does_not_block_next_key(self):
+        with patch.object(crypto, "_aes_ecb_decrypt", side_effect=[b"not an image", self.PNG]):
+            self.assertEqual(self.download(b"x" * 16, raw_key=KEY, nested_key=b"different-key-16"), self.PNG)
+        self.assertEqual(self.diagnostics()[-1]["strategy"], "media:parsed-ECB")
+
+    def test_dual_source_decrypt_failure_then_success(self):
+        good = crypto._aes_ecb_encrypt(self.PNG, KEY)
+        with patch.object(media.urllib.request, "urlopen", side_effect=[Response(b"bad"), Response(good)]):
+            media.download_media({"encrypt_query_param": "PRIVATE-PARAM", "full_url": "https://cdn.invalid/PRIVATE-URL"},
+                                 KEY, self.path, expected_type="image")
+        self.assertEqual(self.path.read_bytes(), self.PNG)
+        self.assertEqual([(x["source"], x["stage"], x["outcome"]) for x in self.diagnostics()],
+                         [("param", "decrypt", "failed"), ("full_url", "decrypt", "success")])
+
+    def test_http_failure_has_no_previous_source_bytes_and_no_secrets(self):
+        import urllib.error
+        secret_key = "PRIVATE-KEY-CHARACTERS-SENTINEL"
+        error = urllib.error.HTTPError("https://cdn.invalid/PRIVATE-URL?PRIVATE-QUERY", 403,
+                                       "PRIVATE-BODY", None, None)
+        with patch.object(media.urllib.request, "urlopen", side_effect=[Response(b"bad"), error]):
+            with self.assertRaises(ValueError) as caught:
+                media.download_media({"encrypt_query_param": "PRIVATE-PARAM", "full_url": "https://cdn.invalid/PRIVATE-URL",
+                                      "aes_key": secret_key}, KEY, self.path, expected_type="image")
+        events = self.diagnostics()
+        self.assertEqual(events[0]["bytes"], 3)
+        self.assertEqual(events[1]["stage"], "http")
+        self.assertIsNone(events[1]["bytes"])
+        self.assertIsNone(events[1]["block_aligned"])
+        self.assertEqual(events[1]["attempted"], [])
+        self.assertEqual(events[1]["http_status"], 403)
+        logged = "\n".join(self.logs) + str(caught.exception)
+        for secret in (secret_key, KEY.decode(), "PRIVATE-URL", "PRIVATE-QUERY", "PRIVATE-PARAM", "PRIVATE-BODY"):
+            self.assertNotIn(secret, logged)
+        self.assertEqual(events[1]["keys"]["media.aes_key"]["length"], len(secret_key))
+
+    def test_plain_and_encrypted_size_boundaries_preserve_old_file(self):
+        self.path.write_bytes(b"previous-file")
+        exact = b"\x89PNG\r\n\x1a\n" + b"x" * 24
+        with patch.object(media, "MAX_MEDIA_BYTES", 32):
+            iv = bytes(range(16))
+            for body in (exact, crypto._aes_ecb_encrypt(exact, KEY),
+                         iv + self.cbc(exact, KEY, iv)):
+                self.assertEqual(self.download(body), exact)
+            for body in (exact + b"x", crypto._aes_ecb_encrypt(exact + b"x", KEY),
+                         iv + self.cbc(exact + b"x", KEY, iv), b"x" * 80):
+                with self.assertRaises(ValueError):
+                    self.download(body)
+                self.assertEqual(self.path.read_bytes(), exact)
+        self.assertEqual(list(self.root.glob(".media-*")), [])
+
+    def test_atomic_replace_failure_preserves_old_file_and_cleans_temp(self):
+        self.path.write_bytes(b"previous-file")
+        with patch.object(media.os, "replace", side_effect=OSError("synthetic replace failure")):
+            with self.assertRaises(OSError):
+                self.download(self.PNG)
+        self.assertEqual(self.path.read_bytes(), b"previous-file")
+        self.assertEqual(list(self.root.glob(".media-*")), [])
+
+    def test_field_tree_is_bounded_and_never_includes_values_or_unsafe_names(self):
+        item = {"aeskey": "PRIVATE-KEY", "media": {"aes_key": "PRIVATE-NESTED", "full_url": "PRIVATE-URL"},
+                "PRIVATE-BODY": "PRIVATE-BODY", "https://PRIVATE-URL\n": "PRIVATE-BODY"}
+        for _ in range(12):
+            item = {"media": item}
+        media.log_image_item_fields(item)
+        tree = json.loads(self.logs[-1].split(" ", 1)[1])
+        self.assertTrue(tree["truncated"])
+        self.assertLessEqual(len(tree["fields"]), 64)
+        self.logs.clear()
+        media.log_image_item_fields({"aeskey": "PRIVATE-KEY", "media": {"aes_key": "PRIVATE-NESTED"},
+                                     "full_url": "PRIVATE-URL", "https://PRIVATE-BODY\n": "PRIVATE-BODY"})
+        self.assertEqual(len(self.logs), 1)
+        for secret in ("PRIVATE-KEY", "PRIVATE-NESTED", "PRIVATE-URL", "PRIVATE-BODY"):
+            self.assertNotIn(secret, self.logs[0])
+        self.assertNotIn("\n", self.logs[0])
+        media.log_image_item_fields({str(n): {"aeskey": "PRIVATE"} for n in range(100)})
+        self.assertLessEqual(len(json.loads(self.logs[-1].split(" ", 1)[1])["fields"]), 64)
+
+    def test_new_identifier_field_names_are_visible_but_values_are_not(self):
+        media.log_image_item_fields({"aeskey": "SensitiveKeyName", "SensitiveKeyName": "private",
+                                     "cdn_image_media": {"encryption_key_blob": "PRIVATE-BLOB"}})
+        logged = self.logs[-1]
+        self.assertIn('"cdn_image_media"', logged)
+        self.assertIn('"encryption_key_blob"', logged)
+        self.assertNotIn("PRIVATE-BLOB", logged)
+        self.assertNotIn("SensitiveKeyName", logged)
+
+    def test_receiver_keeps_raw_item_key_and_logs_one_field_tree(self):
+        raw = "synthetic:original-item-key"
+        cipher = crypto._aes_ecb_encrypt(self.PNG, hashlib.md5(raw.encode()).digest())
+        store = Store(str(self.root / "store"))
+        msg = {"message_id": "synthetic-image", "message_type": 1, "from_user_id": "owner",
+               "context_token": "PRIVATE-CONTEXT", "item_list": [{"type": ilink.ITEM_IMAGE,
+               "image_item": {"aeskey": raw, "media": {"full_url": "https://cdn.invalid/PRIVATE-URL"}}}]}
+        with patch.object(media.urllib.request, "urlopen", return_value=Response(cipher)):
+            self.assertTrue(serve.handle_incoming(store, msg, "owner"))
+        inbox = load_json(Path(store.inbox_dir) / "synthetic-image.json")
+        self.assertEqual(Path(inbox["media_paths"][0]).read_bytes(), self.PNG)
+        self.assertEqual(len([x for x in self.logs if x.startswith("image_item_fields ")]), 1)
+        self.assertNotIn(raw, "\n".join(self.logs))
+        self.assertNotIn("PRIVATE-CONTEXT", "\n".join(self.logs))
 
 
 if __name__ == "__main__":

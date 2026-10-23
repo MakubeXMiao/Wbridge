@@ -71,7 +71,7 @@ class ReceiverHardening(unittest.TestCase):
         return result, polls, delays
 
     @staticmethod
-    def fake_download(media, key, dest):
+    def fake_download(media, key, dest, expected_type=None):
         pathlib.Path(dest).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(dest).write_bytes(media["marker"].encode())
         return dest

@@ -22,7 +22,7 @@ from .ilink import (
     ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE,
     auth_headers, http_json, is_token_invalid, resp_ok, send_message, split_text,
 )
-from .media import download_media, media_type_from_path, send_media_message
+from .media import download_media, log_image_item_fields, media_type_from_path, send_media_message
 from .store import (
     Store, atomic_write_json, atomic_write_text, load_json, log,
     mark_needs_relogin, message_receipt_lock, quarantine_record, safe_message_id,
@@ -243,7 +243,13 @@ def handle_incoming(store, msg, owner_id):
         dest_name = "%s_%03d_%s" % (message_id, index, suffix)
         dest = os.path.join(store.media_dir, time.strftime("%Y%m%d"), dest_name)
         try:
-            download_media(sub.get("media") or {}, _media_key(sub), dest)
+            if item["type"] == ITEM_IMAGE:
+                log_image_item_fields(sub)
+                # Keep the original private field for raw-string derivations.
+                download_media(sub.get("media") or {}, sub.get("aeskey"), dest,
+                               expected_type="image")
+            else:
+                download_media(sub.get("media") or {}, _media_key(sub), dest)
             media_paths.append(dest)
             log("已接收附件 [%s] item=%d kind=%s" % (message_id, index, kind))
         except Exception as error:
