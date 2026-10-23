@@ -41,8 +41,29 @@ if [ "$decision" != wake ]; then
   silent "$reason" "$payload"
   exit 0
 fi
+# Adapter paths come from the installed Hook, never from message contents.
+# A missing companion must fail visibly, not fall back to model-written outbox.
+ADAPTER="${WECHAT_MUSE_ADAPTER:-$(cd -- "$(dirname -- "$0")" && pwd -P)/muse-worker.py}"
+if [ "$reason" = new_wechat_message ] && [ ! -f "$ADAPTER" ]; then
+  echo '{"stage":"muse_adapter_missing","must_stop":true}' >&2
+  exit 1
+fi
+payload="$("$PYTHON" -c '
+import hashlib,json,pathlib,sys
+p=json.load(sys.stdin)
+a=pathlib.Path(sys.argv[1]).resolve()
+p["muse_adapter"]={"path":str(a),"protocol":1,
+    "sha256":hashlib.sha256(a.read_bytes()).hexdigest() if a.is_file() else None}
+print(json.dumps(p,ensure_ascii=False))
+' "$ADAPTER" <<< "$payload")"
+# These timestamps observe the wake call only. A successful return is not
+# proof that a platform worker started, adopted a batch, or delivered a reply.
+wake_at="$("$PYTHON" -c 'import time; print(time.time())')"
+"$PYTHON" -c 'import json,sys; print(json.dumps({"stage":"wake_called","at":float(sys.argv[1]),"reason":sys.argv[2]}),file=sys.stderr)' "$wake_at" "$reason"
 accepted=0
-if wake "$reason" "$payload"; then accepted=1; fi
+wake_exit=0
+if wake "$reason" "$payload"; then accepted=1; else wake_exit=$?; fi
+"$PYTHON" -c 'import json,sys,time; now=time.time(); print(json.dumps({"stage":"wake_returned","at":now,"elapsed_seconds":round(now-float(sys.argv[1]),6),"exit_code":int(sys.argv[2]),"runtime_accepted":bool(int(sys.argv[3])),"worker_started_confirmed":False}),file=sys.stderr)' "$wake_at" "$wake_exit" "$accepted"
 # Keep attempts unconfirmed. Cooling retries never mean 'delivered'.
 keys=()
 while IFS= read -r key; do
