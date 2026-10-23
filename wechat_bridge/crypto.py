@@ -125,12 +125,34 @@ def _key_derivations(value):
     return result
 
 
+def _verify_image_structure(data):
+    """Only break a candidate collision; never log data or decode pixels."""
+    try:
+        from io import BytesIO
+        import warnings
+        from PIL import Image
+        # Keep Pillow's normal limits and exceptions. Capture its warnings
+        # locally rather than emitting details from speculative plaintext.
+        with warnings.catch_warnings(record=True):
+            with BytesIO(data) as stream:
+                with Image.open(stream) as image:
+                    if image.format not in ("JPEG", "PNG", "GIF", "WEBP"):
+                        return False
+                    image.verify()
+        return True
+    except Exception:
+        return False
+
+
 def try_decrypt_variants(encrypted, raw_key_str, key_override=None,
                          expected_type=None, attempted=None):
     """暴力尝试多种密钥派生 × 加密模式组合，返回 (明文, 策略名)。
 
     用于微信视频等搞不清密钥格式的场景：哪个能解出有效文件头
     （MP4 的 ftyp / JPEG 头）就用哪个。
+    图片模式须检查全部候选：不同明文都通过 padding/magic 时才用有限
+    图片结构校验消歧，仍无法唯一确认则返回 (None, "ambiguous-image")。
+    无碰撞时不增加结构校验；同一明文被多个策略命中只算一个结果。
     """
     from Crypto.Cipher import AES
     if not encrypted or len(encrypted) % AES.block_size:
@@ -153,6 +175,9 @@ def try_decrypt_variants(encrypted, raw_key_str, key_override=None,
             if identity not in seen:
                 seen.add(identity)
                 candidates.append((kb, mode, iv, offset, dname + "-" + suffix))
+    image_plain, image_strategy = None, None
+    image_collision = False
+    image_digests = set()
     for kb, mode, iv, offset, name in candidates:
         if attempted is not None:
             attempted.append(name)
@@ -174,10 +199,35 @@ def try_decrypt_variants(encrypted, raw_key_str, key_override=None,
         if out[-pad:] != bytes([pad]) * pad:
             continue
         plain = out[:-pad]
+        del out
         if expected_type == "image":
             if image_magic(plain) != "other":
-                return plain, name
+                if not image_collision and image_plain is None:
+                    image_plain, image_strategy = plain, name
+                elif not image_collision:
+                    if plain == image_plain:
+                        continue
+                    image_collision = True
+                    image_digests.add(hashlib.sha256(image_plain).digest())
+                    image_digests.add(hashlib.sha256(plain).digest())
+                    if not _verify_image_structure(image_plain):
+                        image_plain, image_strategy = None, None
+                    if _verify_image_structure(plain):
+                        if image_plain is not None:
+                            return None, "ambiguous-image"
+                        image_plain, image_strategy = plain, name
+                else:
+                    digest = hashlib.sha256(plain).digest()
+                    if digest in image_digests:
+                        continue
+                    image_digests.add(digest)
+                    if _verify_image_structure(plain):
+                        if image_plain is not None:
+                            return None, "ambiguous-image"
+                        image_plain, image_strategy = plain, name
         elif image_magic(plain) != "other" or plain[:2] == b"\xff\xd8" or b"ftyp" in plain[:32] \
            or plain[:4] == b"\x00\x00\x00\x20" or plain[:8].startswith(b"\x00\x00\x00"):
             return plain, name
-    return None, None
+    if image_collision and image_plain is None:
+        return None, "ambiguous-image"
+    return image_plain, image_strategy

@@ -393,10 +393,10 @@ class ImageReceiveDiagnostics(unittest.TestCase):
         self.assertEqual(self.download(cipher, raw_key=b"wrong-key-16byte!", nested_key=raw), self.PNG)
         self.assertIn("media:raw-md5", self.diagnostics()[-1]["strategy"])
 
-    def test_parsed_padding_only_result_does_not_block_next_key(self):
-        with patch.object(crypto, "_aes_ecb_decrypt", side_effect=[b"not an image", self.PNG]):
-            self.assertEqual(self.download(b"x" * 16, raw_key=KEY, nested_key=b"different-key-16"), self.PNG)
-        self.assertEqual(self.diagnostics()[-1]["strategy"], "media:parsed-ECB")
+    def test_same_plaintext_from_both_key_fields_is_not_ambiguous(self):
+        cipher = crypto._aes_ecb_encrypt(self.PNG, KEY)
+        self.assertEqual(self.download(cipher, raw_key=KEY,
+                                       nested_key=base64.b64encode(KEY).decode()), self.PNG)
 
     def test_dual_source_decrypt_failure_then_success(self):
         good = crypto._aes_ecb_encrypt(self.PNG, KEY)
@@ -493,6 +493,81 @@ class ImageReceiveDiagnostics(unittest.TestCase):
         self.assertEqual(len([x for x in self.logs if x.startswith("image_item_fields ")]), 1)
         self.assertNotIn(raw, "\n".join(self.logs))
         self.assertNotIn("PRIVATE-CONTEXT", "\n".join(self.logs))
+
+    @staticmethod
+    def real_image(fmt="PNG", color="red"):
+        from PIL import Image
+        stream = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(stream, format=fmt)
+        return stream.getvalue()
+
+    def test_image_magic_in_cbc_iv_does_not_save_ciphertext_as_plain(self):
+        plain = self.real_image()
+        for iv in (b"\x89PNG\r\n\x1a\n" + b"iv-bytes",
+                   b"\xff\xd8\xff" + b"Q" * 13):
+            cipher = iv + self.cbc(plain, KEY, iv)
+            self.assertNotEqual(crypto.image_magic(cipher), "other")
+            self.assertEqual(self.download(cipher), plain)
+            self.assertIn("CBC-prefix-IV", self.diagnostics()[-1]["strategy"])
+
+    def test_cbc_wrong_iv_header_collision_selects_valid_image(self):
+        for fmt, key in (("PNG", b"\x00" * 8 + b"Q" * 8),
+                         ("JPEG", b"\x00" * 3 + b"Q" * 13)):
+            plain = self.real_image(fmt)
+            self.assertEqual(self.download(self.cbc(plain, key, key), raw_key=key), plain)
+            self.assertIn("CBC-key", self.diagnostics()[-1]["strategy"])
+
+    def test_ecb_images_are_not_rejected_by_wrong_cbc_padding_collision(self):
+        plain = self.real_image()
+        for index in range(1024):
+            key = hashlib.sha256(("synthetic-ecb-%d" % index).encode()).digest()[:16]
+            out, strategy = crypto.try_decrypt_variants(
+                crypto._aes_ecb_encrypt(plain, key), key, expected_type="image")
+            self.assertEqual(out, plain, (index, strategy))
+
+    def test_ambiguous_decryption_cannot_fall_back_to_plain_or_replace_old_file(self):
+        self.path.write_bytes(b"previous-file")
+        with patch.object(crypto, "try_decrypt_variants", return_value=(None, "ambiguous-image")):
+            with self.assertRaises(ValueError):
+                self.download(self.PNG)
+        self.assertEqual(self.path.read_bytes(), b"previous-file")
+        self.assertEqual(self.diagnostics()[-1]["error"], "decrypt_ambiguous")
+        self.assertEqual(list(self.root.glob(".media-*")), [])
+
+    def test_conflicting_key_sources_cannot_choose_arbitrary_plaintext(self):
+        with patch.object(crypto, "try_decrypt_variants", side_effect=[
+                (self.real_image(color="red"), "candidate-a"),
+                (self.real_image(color="blue"), "candidate-b")]):
+            with self.assertRaises(ValueError):
+                self.download(b"x" * 32, nested_key=b"other-key-value!")
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.diagnostics()[-1]["error"], "decrypt_ambiguous")
+
+    def test_cross_key_collision_uses_only_structure_valid_candidate(self):
+        plain = self.real_image()
+        with patch.object(crypto, "try_decrypt_variants", side_effect=[
+                (self.PNG, "synthetic-invalid-container"), (plain, "synthetic-valid-container")]):
+            self.assertEqual(self.download(b"x" * 32, nested_key=b"other-key-value!"), plain)
+
+    def test_real_key_names_remain_hidden_after_traversal_budget_is_exhausted(self):
+        for secret in ("SensitiveKeyName", "abcdef0123456789abcdef0123456789"):
+            item = {secret: None}
+            item.update({"metadata_%d" % index: 0 for index in range(70)})
+            item["aeskey"] = secret
+            media.log_image_item_fields(item)
+            self.assertNotIn(secret, self.logs[-1])
+            self.assertTrue(json.loads(self.logs[-1].split(" ", 1)[1])["truncated"])
+
+    def test_encoded_key_field_names_are_hidden_but_descriptive_names_remain(self):
+        key_hex = "abcdef0123456789abcdef0123456789"
+        encoded = base64.b64encode(bytes.fromhex(key_hex)).decode().rstrip("=")
+        media.log_image_item_fields({key_hex: None, encoded: None,
+            "aeskey": base64.b64encode(key_hex.encode()).decode(),
+            "cdn_image_media": {"encryption_key_blob": "synthetic-value"}})
+        self.assertNotIn(key_hex, self.logs[-1])
+        self.assertNotIn(encoded, self.logs[-1])
+        self.assertIn('"cdn_image_media"', self.logs[-1])
+        self.assertIn('"encryption_key_blob"', self.logs[-1])
 
 
 if __name__ == "__main__":

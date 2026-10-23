@@ -73,6 +73,51 @@ def log_image_item_fields(item):
     truncated = False
     private_values = set()
 
+    def remember(value):
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("ascii")
+            except UnicodeError:
+                return
+        if not isinstance(value, str) or not 0 < len(value) <= 4096:
+            return
+        private_values.add(value)
+        try:
+            key = crypto.parse_aes_key(value)
+        except (ValueError, TypeError):
+            return
+        private_values.update((key.hex(), key.hex().upper()))
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            encoded = encode(key).decode("ascii")
+            private_values.update((encoded, encoded.rstrip("=")))
+
+    # These actual key fields must not lose protection when unrelated metadata
+    # exhausts the bounded generic traversal before it reaches them.
+    if isinstance(item, dict):
+        remember(item.get("aeskey"))
+        nested = item.get("media")
+        if isinstance(nested, dict):
+            remember(nested.get("aes_key"))
+
+    def opaque_key_name(name):
+        if re.fullmatch(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{64})", name):
+            return True
+        # Unpadded AES base64 can also be a syntactically valid identifier.
+        # Canonical round-trip limits false positives; some unknown names may
+        # still be conservatively hidden. No decoded bytes leave this function.
+        if len(name) not in (22, 24, 43, 44):
+            return False
+        raw = name.encode("ascii")
+        for alt, encode in ((None, base64.b64encode), (b"-_", base64.urlsafe_b64encode)):
+            try:
+                decoded = base64.b64decode(raw + b"=" * ((-len(raw)) % 4),
+                                           altchars=alt, validate=True)
+            except (ValueError, TypeError):
+                continue
+            if len(decoded) in (16, 32) and encode(decoded).rstrip(b"=") == raw.rstrip(b"="):
+                return True
+        return False
+
     def collect(value, depth, budget):
         if depth > 5 or budget[0] <= 0:
             return
@@ -101,7 +146,7 @@ def log_image_item_fields(item):
                     break
                 safe = (isinstance(key, str) and len(key) <= 64
                         and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
-                        and key not in private_values)
+                        and key not in private_values and not opaque_key_name(key))
                 name = key if safe else "<redacted-field>"
                 entry = {"path": path + [name]}
                 if isinstance(key, str) and ("key" in key.lower() or key == "iv"):
@@ -162,13 +207,19 @@ def download_media(media, aes_key_override=None, dest_path=None, expected_type=N
             if len(data) > cipher_limit:
                 raise ValueError("媒体密文超过本地大小上限")
             diagnostic["stage"] = "decrypt"
-            if expected_type == "image" and crypto.image_magic(data) != "other":
-                candidate, strategy = data, "plaintext-image"
-                diagnostic["attempted"].append(strategy)
-            else:
+            try:
                 candidate, strategy = _decrypt_media(
                     data, media, aes_key_override, expected_type,
                     diagnostic["attempted"])
+            except ValueError as error:
+                # A legal CBC IV can itself start with an image signature.
+                # Try keyed decoding before the plaintext fallback; never turn
+                # an ambiguous decryption into a successful raw-cipher save.
+                if (error.args == ("media_decrypt_ambiguous",)
+                        or expected_type != "image" or crypto.image_magic(data) == "other"):
+                    raise
+                candidate, strategy = data, "plaintext-image"
+                diagnostic["attempted"].append(strategy)
             if len(candidate) > MAX_MEDIA_BYTES:
                 raise ValueError("媒体明文超过 100MB 上限")
             diagnostic.update(outcome="success", strategy=strategy,
@@ -180,6 +231,8 @@ def download_media(media, aes_key_override=None, dest_path=None, expected_type=N
             # HTTPError/URLError/Request exception text can contain the entire
             # signed URL. Only fixed classifications may leave this function.
             error = "http_failed" if diagnostic["stage"] == "http" else "decrypt_or_size_failed"
+            if isinstance(e, ValueError) and e.args == ("media_decrypt_ambiguous",):
+                error = "decrypt_ambiguous"
             diagnostic.update(outcome="failed", error=error)
             if isinstance(e, urllib.error.HTTPError) and isinstance(e.code, int):
                 diagnostic["http_status"] = e.code
@@ -209,6 +262,28 @@ def _decrypt_media(encrypted, media, aes_key_override, expected_type=None, attem
     if attempted is None:
         attempted = []
     sources = (("item", aes_key_override), ("media", media.get("aes_key")))
+    if expected_type == "image":
+        selected = None
+        selected_strategy = None
+        for label, source in sources:
+            names = []
+            plain, strategy = crypto.try_decrypt_variants(
+                encrypted, source, expected_type="image", attempted=names)
+            attempted.extend(label + ":" + name for name in names)
+            if strategy == "ambiguous-image":
+                raise ValueError("media_decrypt_ambiguous")
+            if plain is not None:
+                if selected is not None and selected != plain:
+                    selected_valid = crypto._verify_image_structure(selected)
+                    current_valid = crypto._verify_image_structure(plain)
+                    if selected_valid == current_valid:
+                        raise ValueError("media_decrypt_ambiguous")
+                    if selected_valid:
+                        continue
+                selected, selected_strategy = plain, label + ":" + strategy
+        if selected is not None:
+            return selected, selected_strategy
+        raise ValueError("media_decrypt_failed")
     candidates = []
     for label, source in sources:
         if expected_type == "image" and (not isinstance(source, (str, bytes, bytearray))
