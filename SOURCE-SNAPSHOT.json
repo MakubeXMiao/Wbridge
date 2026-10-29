@@ -1,0 +1,708 @@
+{
+  "schema_version": 1,
+  "publication": "complete public source snapshot, retaining public repository history",
+  "runtime_source_provenance": "1f0160bc42e016cb47c273c091575f296c3d9634",
+  "test_fixture_fix_provenance": "9ab987b260b9bb3a6b958c7ad7c17aa4943f8af1",
+  "private_git_history_included": false,
+  "previous_public_main": "e1e72168ca8e1d2819df439cd3a1119aa4078eca",
+  "runtime_scope": "wechat_bridge package and executable Hook/prompt bytes unchanged from runtime provenance",
+  "documentation_scope": "public installation paths, links, verification limits and safe rollback",
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 520,
+      "sha256": "4b73592263a439f0c48416a5e06cc01de571442cfe826ad2c5bc035a157cd06a",
+      "executable": false
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1083,
+      "sha256": "69993a60e8a6dcc8a1bf8df514693bb6dc9faad28a95a3e04a6dc323127decfd",
+      "executable": false
+    },
+    {
+      "path": "README.md",
+      "bytes": 4478,
+      "sha256": "4007a36df127fdaee846696f264fcadbe00d8dc5e98eb23be004736480994f9a",
+      "executable": false
+    },
+    {
+      "path": "docs/CONNECTOR.md",
+      "bytes": 4327,
+      "sha256": "9a8187278f09bb1573eb529b933c2499bc8c1d18b6234a391b02e928e075170b",
+      "executable": false
+    },
+    {
+      "path": "docs/PUBLIC-UPDATE-20261029.md",
+      "bytes": 5147,
+      "sha256": "14bd1f11270975a3ad22eb8b078db8a68376cf6941664405c2b6ea8fc732a04e",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/ATTACHMENT-INBOX-IMPLEMENTATION.md",
+      "bytes": 16481,
+      "sha256": "531a42f2d1d1aa4dfda5f64e96de4af187160e51c22da9d2893c5c32bbc8111c",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/ATTACHMENT-INBOX-V1.md",
+      "bytes": 27578,
+      "sha256": "6480e97dee68b60ee3a4568f5f5516b2baabff6d280b5fd22f79e26b98a52223",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/BACKEND-CONTRACT-CANDIDATE.md",
+      "bytes": 22096,
+      "sha256": "587b94464765193c2a12772475c30df8f4ecd9313a70cd514b2651e6b6965ed8",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/BACKEND-CONTRACT-V1.md",
+      "bytes": 9966,
+      "sha256": "4a160e4a5df49bbb5555e73f2ba28fea628ee01eb1cbf41ecc4788333053911b",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/INBOX-MEDIA-DIAGNOSTICS-V1.md",
+      "bytes": 3196,
+      "sha256": "21def045d37179e51690f56b642622903caa38f5969f912fd02352d6d56716b0",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/MEDIA-DIAGNOSTICS-V2.md",
+      "bytes": 7069,
+      "sha256": "8270dde4550a09e0724c544c48f741c5d178edf996d2f7f969ccd053067f22c8",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/MUSE-PUBLIC-REPAIR-012.md",
+      "bytes": 11092,
+      "sha256": "07045fdd9e398bba931c163af00e8e4483a2907254b2dbb6c9cc78b3d95a2f4c",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/QUICKSTART-V1.md",
+      "bytes": 6597,
+      "sha256": "bf5db65609fa5b15f18594af450223dcf8d9b9a06bfbaeb4c17b757369becad1",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/SUPERVISION-EVENTS-V1.md",
+      "bytes": 2361,
+      "sha256": "c173cc001bf64845697f0bf67caf1d7ae96c3717601ef83aa1fbc33d13d1d99b",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/01-core/VALIDATION-AND-MIGRATION.md",
+      "bytes": 11700,
+      "sha256": "25b85146f1b051899c082df41655f5fac878f4abca7f001e83229a401df9b13f",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/02-muse/MUSE-ADAPTER-HANDOFF.md",
+      "bytes": 4744,
+      "sha256": "62e22d6d43674101dcd7261960dba33c11bd353a3f36d507a2f49aa17a526fb4",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/02-muse/MUSE-ATTACHMENT-003-ADAPTER.md",
+      "bytes": 10899,
+      "sha256": "4e23e452d580910f3b2ca303654bf1efbba52f81fe38d2b3082f3dd38a9fa6b6",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/02-muse/MUSE-ATTACHMENT-003-DEPLOYMENT.md",
+      "bytes": 3383,
+      "sha256": "3603634b3f49e826ecaf5dbe771fbcfd2bde1f42bc69a13e1f111f78629402e9",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/03-codex/APPROVAL-FIXTURE-20261029.md",
+      "bytes": 2061,
+      "sha256": "a0f851751cdee36138b24ff681bc22be99ea5b6f7f23fd2dbc98b5d12e5fc164",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/03-codex/IMPLEMENTATION.md",
+      "bytes": 8178,
+      "sha256": "0ffb6aa3e53340db56c7b8aa14a7a6b50a8cf10724d5e454f48f06335c7fb8fa",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/03-codex/INTERFACE-REQUIREMENTS.md",
+      "bytes": 6079,
+      "sha256": "ec9865b63642d347c747cc53f452b5765f22bd2dcffa8ab57d06cfc86f63b271",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/03-codex/LOCAL-TESTING.md",
+      "bytes": 5048,
+      "sha256": "78f5b95a478a04c80c91de4cf97937cf6d07225c762bfe9459727db3f5cb8913",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/03-codex/README.md",
+      "bytes": 1277,
+      "sha256": "dae52bf4e637b74cebac11e3b471d46f704724078d79d7e2380429f65af0e10d",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/03-codex/backends.example.json",
+      "bytes": 585,
+      "sha256": "7b1f61b8d007f35e4d114e05bda63711bf168d3b715ab07d90981cf93537d438",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/04-cc/COLLABORATOR-ACCEPTANCE.md",
+      "bytes": 7478,
+      "sha256": "9b9e839fbbe3e8ee899780cbd3664a9459bceaa47b7c16f18f5f161b6255f0fc",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/04-cc/IMPLEMENTATION.md",
+      "bytes": 9452,
+      "sha256": "112b334297b7e9b6dd2ad1094c16ada75491647ba4dc39ead8a77ba978a390de",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/04-cc/INTERFACE-REQUESTS.md",
+      "bytes": 8033,
+      "sha256": "51d8fcf06e4bf22b34640273c5d3e5a807c6fbbbfd6c39b0cbe1839abf2b0209",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/04-cc/probe_backend_offline.py",
+      "bytes": 4473,
+      "sha256": "466f0161655869cd60751e6801f0b9865e9b2d4b5e9ec4fcd83349d4d6dec598",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/04-cc/probe_cli_offline.py",
+      "bytes": 7570,
+      "sha256": "89d0d5feec7ca4aca06888010d011160fe361ffad322b8016a3d61e839af3f60",
+      "executable": false
+    },
+    {
+      "path": "docs/lines/04-cc/test_dispatcher_integration.py",
+      "bytes": 14266,
+      "sha256": "25975f99a119827813ebc39c29d858e033cfeac44b58d908fe8fb8e38f6c92ca",
+      "executable": false
+    },
+    {
+      "path": "hooks/WORKER-STATE.md",
+      "bytes": 9549,
+      "sha256": "b842d34e83309195585b47c7c7a45f43ee77472268aff1dd1b807a54b0ca6c53",
+      "executable": false
+    },
+    {
+      "path": "hooks/muse-deploy-check.py",
+      "bytes": 19731,
+      "sha256": "c1f0a3abdd6953c9f67712a47dcdc68f22fd90858a8f28ae0514b3f47fecec0e",
+      "executable": false
+    },
+    {
+      "path": "hooks/muse-worker.py",
+      "bytes": 51688,
+      "sha256": "37de71ebd9e4aeac9aa029b671c84e2aebd668ceba052320475eed656b8464ad",
+      "executable": false
+    },
+    {
+      "path": "hooks/tests/run_offline.py",
+      "bytes": 1924,
+      "sha256": "c4616cda7533c9a71b10ebcda169192169c40f5cb3d3b49498b5d36c4be359cc",
+      "executable": false
+    },
+    {
+      "path": "hooks/tests/test_muse_deploy_check.py",
+      "bytes": 27795,
+      "sha256": "ef24d5120747ab636bff1cf5a8ae60b029a7b179324db82c176748e19495838e",
+      "executable": false
+    },
+    {
+      "path": "hooks/tests/test_muse_hook.py",
+      "bytes": 5530,
+      "sha256": "e806f9c400e44719c6ac1ad83808553abcf568e17b3722239a17f5e56b4a6e5c",
+      "executable": false
+    },
+    {
+      "path": "hooks/tests/test_muse_prequeue.py",
+      "bytes": 12205,
+      "sha256": "1009e08efb809f9238e2e03bf0b85c27e131fdcdcac3cb80c4bcb0e3c5fa83a3",
+      "executable": false
+    },
+    {
+      "path": "hooks/tests/test_muse_worker.py",
+      "bytes": 82106,
+      "sha256": "a2a8fff8c45b7dd32cbdf9d0a6bd0e0770f79497b343e477a0af28c0f7ab2ff5",
+      "executable": false
+    },
+    {
+      "path": "hooks/wechat-inbox-watch.json",
+      "bytes": 11733,
+      "sha256": "db93147f62986d2c95a1e212d12547f73f02f3756be573deae8a77c7da8bfbb3",
+      "executable": false
+    },
+    {
+      "path": "hooks/wechat-inbox-watch.sh",
+      "bytes": 4312,
+      "sha256": "6310ab1b876c6dea8abd90ff7f3c5cbda5ed9c3d05f6e1a3a5837299e598fcf0",
+      "executable": true
+    },
+    {
+      "path": "pyproject.toml",
+      "bytes": 517,
+      "sha256": "310d3258eabbbe67e771039411872e7d5a0a9daec2b88f8e5669b7cc59e932c5",
+      "executable": false
+    },
+    {
+      "path": "tests/fixtures/hook_runtime.sh",
+      "bytes": 426,
+      "sha256": "803e4cf60e2bf04c968b095489f790075365aeba1edce721726c86e9a7117ad0",
+      "executable": false
+    },
+    {
+      "path": "tests/fixtures/legacy_capture_v1/LICENSE",
+      "bytes": 1083,
+      "sha256": "69993a60e8a6dcc8a1bf8df514693bb6dc9faad28a95a3e04a6dc323127decfd",
+      "executable": false
+    },
+    {
+      "path": "tests/fixtures/legacy_capture_v1/README.md",
+      "bytes": 1407,
+      "sha256": "b689cf4b900b4af445e7a12533410f4b7cb183d178e6d5f9acd37a5b65a14305",
+      "executable": false
+    },
+    {
+      "path": "tests/fixtures/legacy_capture_v1/failure_capture.py",
+      "bytes": 17640,
+      "sha256": "9f05aacf7b16d4231cb8a53b0910250bd728dbb6448057a63a8bed39305c751b",
+      "executable": false
+    },
+    {
+      "path": "tests/fixtures/legacy_capture_v1/media_diagnostics.py",
+      "bytes": 2450,
+      "sha256": "138a24e589af9891341e087c692f3d3d036d148d81ad6ca138b1325e148968e6",
+      "executable": false
+    },
+    {
+      "path": "tests/run_offline.py",
+      "bytes": 3875,
+      "sha256": "1d088e8a68a31b63b1c0a71f297efa842820aaa2fd11cb43d379be8695a1699e",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_admission_isolation.py",
+      "bytes": 19867,
+      "sha256": "ef6a6616b2fdfe81ffe12ed1c0431eca0bf17df19912319242f02862ced62e01",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_caution.py",
+      "bytes": 11515,
+      "sha256": "0422c47aaa515f78bcee337a8a1753416ee7a5d30575b154dba6b49edae6ac77",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_controls.py",
+      "bytes": 17934,
+      "sha256": "d6254cda1d45926436c6dd53523758c481be96004bf8cc8cfdf2033ad660ab71",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_delivery.py",
+      "bytes": 84949,
+      "sha256": "9957ad92b0ddcf6332130c98c74852deb03d164efd46e3066547dec8458d52d3",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_gc.py",
+      "bytes": 15334,
+      "sha256": "5edc52088116813eda3bf8b39bddcaf7aee39fb7bc31af528ef1eaa9cd12adfc",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_labels.py",
+      "bytes": 22241,
+      "sha256": "b428579b229d6c829f6895c08bc04ea3144415827d114d90c7d5e8c29b370717",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_legacy_originals.py",
+      "bytes": 11295,
+      "sha256": "9c5e77072528b0b0982988afa9a13ae037cfeffee6a185e49fac9f3c8c99214d",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_originals.py",
+      "bytes": 12307,
+      "sha256": "a5b9f2db766d24e57dc824d54cee69111a5135c4f8e73e0011108e44e5d30405",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_r1_regressions.py",
+      "bytes": 24937,
+      "sha256": "ceb5446e8052b5f1c626ecc65304c8c51e1b98baa71267e82dee36a71a48aa61",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_runtime.py",
+      "bytes": 39744,
+      "sha256": "42c4679e4b7316a2b4af402dbd0d38c1992eaee0592555625d8e2cb481594a25",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_stage_safety.py",
+      "bytes": 19940,
+      "sha256": "b7edc718291b5039cefb67a77136e55844ae97b31182aa621779c217ae9479aa",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachment_terminal_reconcile.py",
+      "bytes": 8352,
+      "sha256": "1b70bd95fb2466cd7b50c1e2823bf6c2c8634621f03306e56133e1968835f9cd",
+      "executable": false
+    },
+    {
+      "path": "tests/test_attachments.py",
+      "bytes": 87170,
+      "sha256": "944ee6b9a23fe114c34756c68e526053f3370b28aaa6e19ddb39b90feb18f629",
+      "executable": false
+    },
+    {
+      "path": "tests/test_audit12.py",
+      "bytes": 19702,
+      "sha256": "25c865ebd28a026f3684de49ee3068e993b69b30807f00b6de85dd60db688580",
+      "executable": false
+    },
+    {
+      "path": "tests/test_audit2fix.py",
+      "bytes": 13773,
+      "sha256": "c5002dcaf2d78b14be3e16e29be66fad670ea74bb39d4625d62bafd2a909bb29",
+      "executable": false
+    },
+    {
+      "path": "tests/test_backend_dispatcher.py",
+      "bytes": 17650,
+      "sha256": "6515556796987fe677fa30b6cc31968366da6b6a5a7bc1fdda88c04e76d341b8",
+      "executable": false
+    },
+    {
+      "path": "tests/test_backend_registry.py",
+      "bytes": 18489,
+      "sha256": "539b1af2cb4d697b898737f9761fe49ba5d0271691d60f8fb92f5cbc9e97004e",
+      "executable": false
+    },
+    {
+      "path": "tests/test_burst_ownership.py",
+      "bytes": 21770,
+      "sha256": "8248a65b4d013835c13b39ef8cea0305b337c73a796b46e8943f7a2293eff4e4",
+      "executable": false
+    },
+    {
+      "path": "tests/test_claude_code_backend.py",
+      "bytes": 70084,
+      "sha256": "b52c34e8a503f0cbddb4516ddc837d75d34d8919af5b26162fe7525070ff68a4",
+      "executable": false
+    },
+    {
+      "path": "tests/test_codex_backend.py",
+      "bytes": 57264,
+      "sha256": "dddce40042a9d898413d1b5370d261891d532d93e01b2de8b9c0fe238fc9ba26",
+      "executable": false
+    },
+    {
+      "path": "tests/test_crypto.py",
+      "bytes": 2563,
+      "sha256": "7caefdcb33f24c10d812d283583af3d83a7629d759b97e1f5cbe6ddb5d1d8c36",
+      "executable": false
+    },
+    {
+      "path": "tests/test_delivery_hardening.py",
+      "bytes": 10031,
+      "sha256": "9423fca72eed957d6a3bff533552d636585a2fc04b1c98af5dbef132f9a26a41",
+      "executable": false
+    },
+    {
+      "path": "tests/test_failure_capture.py",
+      "bytes": 44997,
+      "sha256": "58d6bfb03b3714f871ffe05b597670e0f2ad2d82437bb10a15dd2e55a14cb015",
+      "executable": false
+    },
+    {
+      "path": "tests/test_hook_audit12.sh",
+      "bytes": 1069,
+      "sha256": "cf4e0db290fc71675f00d2a06dca5c9e439181f552f5dbd8c747fbecf5b29e72",
+      "executable": false
+    },
+    {
+      "path": "tests/test_hook_audit2fix.sh",
+      "bytes": 1037,
+      "sha256": "82d5b0058abc2f33d49e744b922a92fd54485fe25210dbcc719713c5f2cdc0ce",
+      "executable": false
+    },
+    {
+      "path": "tests/test_hook_rewake.sh",
+      "bytes": 942,
+      "sha256": "29cab09e84d5e39e42bf53821bc69be38e2ab670b628f2f7d38ac7e779c36419",
+      "executable": false
+    },
+    {
+      "path": "tests/test_inbox_media_diagnostics.py",
+      "bytes": 4699,
+      "sha256": "36752b3e99ac84b0f641fa4b8e312b600824a9180888d0231c9a6c8e97a3284e",
+      "executable": false
+    },
+    {
+      "path": "tests/test_latency_trace.py",
+      "bytes": 8407,
+      "sha256": "1eb1d17e6e5adf7fbafb01ae86a038153950ba391af72f4e1be5953f2d801796",
+      "executable": false
+    },
+    {
+      "path": "tests/test_media_http_diagnostics.py",
+      "bytes": 23793,
+      "sha256": "8e8d4a26c2ff59fd346e1161aef33fe6d9b8b4d3de2c708a81e13efe82ff93e6",
+      "executable": false
+    },
+    {
+      "path": "tests/test_media_login_hardening.py",
+      "bytes": 33035,
+      "sha256": "949f8c23a387d8c835847ba5a99438fdf15e4f5729c2255994909844117fffcc",
+      "executable": false
+    },
+    {
+      "path": "tests/test_media_retention.py",
+      "bytes": 10602,
+      "sha256": "d4d66bfe6c79a9dff06e92c0418c2fa64d51d773b265441ad3744048aaea7605",
+      "executable": false
+    },
+    {
+      "path": "tests/test_media_validation.py",
+      "bytes": 8409,
+      "sha256": "47ba67941e47e5d277bb6eff32f7d7aea9a47f694e95f189f242afd1a8cdf5b3",
+      "executable": false
+    },
+    {
+      "path": "tests/test_merge.py",
+      "bytes": 10423,
+      "sha256": "c567a399215fde98719eb9b901580f457303af310af5f2fec350931a434cea40",
+      "executable": false
+    },
+    {
+      "path": "tests/test_p1p7.py",
+      "bytes": 10788,
+      "sha256": "68b8ea5ce7a52e11be0da57fcbb29352b317f32ed935e925b1400bf3dcf48c49",
+      "executable": false
+    },
+    {
+      "path": "tests/test_receiver_hardening.py",
+      "bytes": 18845,
+      "sha256": "74ff8111d3402ec762c558289a16c2a32c01d0578e03b23a2a855b6153c9ebf5",
+      "executable": false
+    },
+    {
+      "path": "tests/test_runtime_logs.py",
+      "bytes": 10203,
+      "sha256": "f2753c69cbb2befd4673cd803e834b49ef51ba884c2c1df3ba870377954b32dd",
+      "executable": false
+    },
+    {
+      "path": "tests/test_second_review_admission.py",
+      "bytes": 27552,
+      "sha256": "efd196c261d1e98da92298a706979d81aa295553a8f0ca05bb175a7321a70194",
+      "executable": false
+    },
+    {
+      "path": "tests/test_second_review_labels.py",
+      "bytes": 3917,
+      "sha256": "8bd1470e59364a5b38d98e8462b44839a6bf5bc70edbdfa19429e716ac7fe705",
+      "executable": false
+    },
+    {
+      "path": "tests/test_second_review_managed_paths.py",
+      "bytes": 19513,
+      "sha256": "8116eaf217b36eb9ee893536d6e20c1053518a2fedc9711abdb048d9e6fa9ebd",
+      "executable": false
+    },
+    {
+      "path": "tests/test_speed.py",
+      "bytes": 9701,
+      "sha256": "3c06628219e6cadd91f90e683fddeb3cbc79652cddf2e9497aa2838c46d444f8",
+      "executable": false
+    },
+    {
+      "path": "tests/test_supervision_events.py",
+      "bytes": 10456,
+      "sha256": "a37da56c840ebb8b9a1798b966beaedb92af6e95b5ca828b10c5b7a78e9b6b66",
+      "executable": false
+    },
+    {
+      "path": "tests/test_worker_state.py",
+      "bytes": 28586,
+      "sha256": "133c17fd57627b8e70f3b657c1eaf432e7fd07d770b0c67ddbf3a3736cb9277b",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/__init__.py",
+      "bytes": 436,
+      "sha256": "2bda7f7e35746977e19bf51147aeb2482febb82e5b7d2766fa26133cdfa977a8",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/__main__.py",
+      "bytes": 83,
+      "sha256": "e0930aeba5a3e2e2d94ca6c5fac4f72c0c4eb2be9bba283becf98e909091471c",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/attachment_caution.py",
+      "bytes": 4966,
+      "sha256": "37df7bb7683f952bae298cdf51ed103db597e8d876e367a4e1461987aa5a0e51",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/attachment_delivery.py",
+      "bytes": 67072,
+      "sha256": "9b3dd3b7cf922cde16cf84b91561c89586b3e3415cbaf411bba1cd7cd5c5a668",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/attachment_runtime.py",
+      "bytes": 55575,
+      "sha256": "704ac98e070f8716761e9a288df381b27990464fca1e5aa1d14120c1572dec85",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/attachments.py",
+      "bytes": 74924,
+      "sha256": "713bbc15e4fa30c53a38eb76b0e1042c6a582c168b593d16c48f3ffea2c469ad",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backend_state.py",
+      "bytes": 4300,
+      "sha256": "4702ba65365a34ecfe090629119295da274383ed7932799d4d55b6577ddd7432",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backends/__init__.py",
+      "bytes": 145,
+      "sha256": "4d3a61f8ffc51cb3c86dc52423246d4b5ec7ef5274fc4eebfa7adb24a09ba537",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backends/_codex_protocol.py",
+      "bytes": 33162,
+      "sha256": "d26800d16a29ebc5361e6583ae62ab11e1e8de40a6300a10ab0657407813f406",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backends/claude_code.py",
+      "bytes": 42360,
+      "sha256": "e1b88307229fe84d57d82fecb0c40b958c3447b245116b4a383e6e427f346d86",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backends/codex.py",
+      "bytes": 13962,
+      "sha256": "75147800ae59be373d8aa5a1207702245ac8becf7b27b9a18ee4291c3b6657d2",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backends/contract.py",
+      "bytes": 3086,
+      "sha256": "d6c1af7a52f1ad226157d60ddb3cece24dc318d05c20d5aa0e90af84543a4c68",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/backends/registry.py",
+      "bytes": 11886,
+      "sha256": "6447142fdc762c42f28360c0b747da53e74cfbe1a48a4ff71034c05f7ccedadb",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/cli.py",
+      "bytes": 25589,
+      "sha256": "7f08ad7447d89e6e618b843af8ac804589e0c5e6a15f0ee7068b8cdb5f95cd94",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/crypto.py",
+      "bytes": 7610,
+      "sha256": "30f9ef6ca6d9b244155982822210a1fab93efcfd8162a916aca9649084fd61a2",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/dispatcher.py",
+      "bytes": 26900,
+      "sha256": "09f14210af5228c067a3b746d45d96d24ce058b7e8150627a55ff61410c00b38",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/failure_capture.py",
+      "bytes": 30966,
+      "sha256": "5f617650ecef805d1217bc24cbda3663184796bedaca6193e36fa872aa666228",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/ilink.py",
+      "bytes": 10881,
+      "sha256": "9c2dbd1d059fd666603bde2b5c386d96f58eaad5aa484656724e27e2e0592c28",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/image_validation.py",
+      "bytes": 7896,
+      "sha256": "e2cd45d2e71b1f49d4dcd086e1ed4479c1dad5d42c9aecac40a7c451082481e6",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/media.py",
+      "bytes": 39782,
+      "sha256": "380f4d384383db8a3504124cd28fd3734df90b3010b19362d4fdef1d38a494cd",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/media_diagnostics.py",
+      "bytes": 2450,
+      "sha256": "138a24e589af9891341e087c692f3d3d036d148d81ad6ca138b1325e148968e6",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/media_retention.py",
+      "bytes": 28519,
+      "sha256": "2c1b6ca418479fd4fcef0ccbe1e80478e671bc70e9f009534c7eeb12b76f4c14",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/progress.py",
+      "bytes": 608,
+      "sha256": "f3976214c06ce32f9306de16f03b090cbc28f64b1913ac8d1e2194ba8c2b40d8",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/runtime_logs.py",
+      "bytes": 13151,
+      "sha256": "c325614662ce3dab75028e0b26ca8b5f2ed4c12bb1195d180fcce8f1666267fe",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/serve.py",
+      "bytes": 75943,
+      "sha256": "b527aeba5b8b2248e138a567226a1c96413ca72a7d77845b37c3ef6c4c5f35e3",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/store.py",
+      "bytes": 6846,
+      "sha256": "e6414fe496d4f2fbac17aae09530de7d95988d202c223edd56cb6396bfdc127d",
+      "executable": false
+    },
+    {
+      "path": "wechat_bridge/worker_state.py",
+      "bytes": 53745,
+      "sha256": "70f7dbb43d14eb121f5b355672093325ca9a21fe8bc4cbfa476b864f44e2c8ea",
+      "executable": false
+    }
+  ]
+}

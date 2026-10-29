@@ -16,6 +16,8 @@ def _aes_ecb_encrypt(data, key):
 
 def _aes_ecb_decrypt(data, key):
     from Crypto.Cipher import AES
+    if not data or len(data) % AES.block_size:
+        raise ValueError("AES 密文必须是非空的完整块")
     out = AES.new(key, AES.MODE_ECB).decrypt(data)
     pad = out[-1]
     if pad < 1 or pad > 16:
@@ -33,6 +35,8 @@ def parse_aes_key(s):
     """解析微信 CDN 的 aes_key。base64 严格解析（标准 + URL 安全），避免静默丢字符。"""
     if isinstance(s, str):
         s = s.encode("utf-8")
+    if not isinstance(s, (bytes, bytearray)):
+        raise ValueError("aes_key 必须是字符串或字节")
     if len(s) == 16:
         return bytes(s)
     if len(s) == 32 and _is_hex(s):
@@ -57,50 +61,123 @@ def parse_aes_key(s):
     raise ValueError("aes_key 格式无法解析 (len=%d)" % len(s))
 
 
-def try_decrypt_variants(encrypted, raw_key_str, key_override=None):
+def image_magic(data):
+    """Return a fixed category, never any bytes from the supplied data."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "GIF"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "WEBP"
+    return "other"
+
+
+def _key_derivations(value):
+    # Bound speculative parsing; retain the original bytes for raw MD5/truncation.
+    if isinstance(value, str):
+        try:
+            value = value.encode("utf-8")
+        except UnicodeError:
+            return []
+    if not isinstance(value, (bytes, bytearray)) or not 0 < len(value) <= 4096:
+        return []
+    raw = bytes(value)
+    result = []
+    seen = set()
+
+    def add(key, name):
+        if len(key) in (16, 32) and key not in seen:
+            seen.add(key)
+            result.append((key, name))
+
+    if len(raw) == 16:
+        add(raw, "raw16")
+    if len(raw) == 32 and _is_hex(raw):
+        add(bytes.fromhex(raw.decode("ascii")), "hex32")
+    for alt in (None, b"-_"):
+        data = raw.strip()
+        try:
+            decoded = base64.b64decode(data + b"=" * ((-len(data)) % 4),
+                                       altchars=alt, validate=True)
+        except Exception:
+            continue
+        tag = "b64" if alt is None else "b64url"
+        if len(decoded) == 32 and _is_hex(decoded):
+            add(bytes.fromhex(decoded.decode("ascii")), tag + "-hex32")
+        if len(decoded) == 16:
+            add(decoded, tag + "-16")
+        if len(decoded) == 32:
+            add(decoded, tag + "-32(AES256)")
+            add(hashlib.md5(decoded).digest(), tag + "-md5")
+        if len(decoded) >= 16:
+            add(decoded[:16], tag + "-first16")
+        if len(decoded) >= 32:
+            add(decoded[:32], tag + "-first32")
+    if len(raw) == 32:
+        add(raw, "raw32(AES256)")
+    if len(raw) >= 16:
+        add(raw[:16], "raw-first16")
+    if len(raw) >= 32:
+        add(raw[:32], "raw-first32")
+    add(hashlib.md5(raw).digest(), "raw-md5")
+    return result
+
+
+def _verify_image_structure(data):
+    """Full bounded decode, not merely a magic/padding/container check."""
+    from .image_validation import validate_image
+    return validate_image(data)
+
+
+def try_decrypt_variants(encrypted, raw_key_str, key_override=None,
+                         expected_type=None, attempted=None, validator=None):
     """暴力尝试多种密钥派生 × 加密模式组合，返回 (明文, 策略名)。
 
     用于微信视频等搞不清密钥格式的场景：哪个能解出有效文件头
     （MP4 的 ftyp / JPEG 头）就用哪个。
+    图片候选均须通过有界完整解码；两个不同有效明文仍拒绝歧义。
+    同一明文被多个策略命中只算一个结果，不扩展密钥或模式集合。
     """
     from Crypto.Cipher import AES
+    if not encrypted or len(encrypted) % AES.block_size:
+        return None, None
+    derivations = _key_derivations(raw_key_str)
+    if isinstance(key_override, bytes) and len(key_override) in (16, 32):
+        derivations.insert(0, (key_override, "override"))
     candidates = []
-    raw = raw_key_str.encode("utf-8") if isinstance(raw_key_str, str) else (raw_key_str or b"")
-    if key_override:
-        candidates.append((key_override, "ECB", None, "override-ECB"))
-    derivations = []
-    if len(raw) == 16:
-        derivations.append((raw, "raw16"))
-    if len(raw) == 32 and _is_hex(raw):
-        derivations.append((bytes.fromhex(raw.decode("ascii")), "hex32"))
-    for alt in (None, b"-_"):
-        d = raw.strip()
-        pad = (-len(d)) % 4
-        try:
-            dec = base64.b64decode(d + b"=" * pad, altchars=alt, validate=True)
-        except Exception:
-            continue
-        tag = "b64" if alt is None else "b64url"
-        if len(dec) == 16:
-            derivations.append((dec, tag + "-16"))
-        if len(dec) == 32:
-            if _is_hex(dec):
-                derivations.append((bytes.fromhex(dec.decode("ascii")), tag + "-hex32"))
-            derivations.append((dec, tag + "-32(AES256)"))
-            derivations.append((dec[:16], tag + "-first16"))
-            derivations.append((hashlib.md5(dec).digest(), tag + "-md5"))
+    seen = set()
     for kb, dname in derivations:
-        if len(kb) == 16:
-            candidates.append((kb, "ECB", None, dname + "-ECB"))
-            candidates.append((kb, "CBC", b"\x00" * 16, dname + "-CBC0"))
-        elif len(kb) == 32:
-            candidates.append((kb, "ECB", None, dname + "-ECB"))
-    for kb, mode, iv, name in candidates:
+        variants = [("ECB", None, 0, "ECB"),
+                    ("CBC", b"\x00" * 16, 0, "CBC0")]
+        if expected_type == "image":
+            variants.append(("CBC", kb[:16], 0,
+                             "CBC-key" if len(kb) == 16 else "CBC-key-first16"))
+            if len(encrypted) >= 32:
+                variants.append(("CBC", encrypted[:16], 16, "CBC-prefix-IV"))
+        for mode, iv, offset, suffix in variants:
+            identity = (kb, mode, iv, offset)
+            if identity not in seen:
+                seen.add(identity)
+                candidates.append((kb, mode, iv, offset, dname + "-" + suffix))
+    image_plain, image_strategy = None, None
+    if expected_type == "image" and validator is None:
+        from .image_validation import ImageValidationBudget
+        validator = ImageValidationBudget()
+    for kb, mode, iv, offset, name in candidates:
+        if attempted is not None:
+            attempted.append(name)
         try:
-            if mode == "ECB":
-                out = AES.new(kb, AES.MODE_ECB).decrypt(encrypted)
-            else:
-                out = AES.new(kb, AES.MODE_CBC, iv=iv).decrypt(encrypted)
+            def cipher():
+                return AES.new(kb, AES.MODE_ECB) if mode == "ECB" else \
+                    AES.new(kb, AES.MODE_CBC, iv=iv)
+            # Reject impossible image heads before decrypting a potentially
+            # 100MB body for every speculative key/mode. CBC is reset below.
+            if expected_type == "image" and image_magic(
+                    cipher().decrypt(encrypted[offset:offset + 16])) == "other":
+                continue
+            out = cipher().decrypt(encrypted[offset:])
         except Exception:
             continue
         pad = out[-1]
@@ -109,7 +186,15 @@ def try_decrypt_variants(encrypted, raw_key_str, key_override=None):
         if out[-pad:] != bytes([pad]) * pad:
             continue
         plain = out[:-pad]
-        if plain[:2] == b"\xff\xd8" or b"ftyp" in plain[:32] \
+        del out
+        if expected_type == "image":
+            if image_magic(plain) != "other" and validator(plain):
+                if image_plain is not None and image_plain != plain:
+                    return None, "ambiguous-image"
+                image_plain, image_strategy = plain, name
+            elif getattr(validator, "limited", False):
+                return None, "image-validation-limited"
+        elif image_magic(plain) != "other" or plain[:2] == b"\xff\xd8" or b"ftyp" in plain[:32] \
            or plain[:4] == b"\x00\x00\x00\x20" or plain[:8].startswith(b"\x00\x00\x00"):
             return plain, name
-    return None, None
+    return image_plain, image_strategy

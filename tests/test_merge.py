@@ -181,9 +181,18 @@ def t_merge_fail_degrades():
     write_job(store, "2.json", text="x2", enqueued_at=now - 29)
     net.send_script = [{"ret": -2, "errmsg": "prepare failed"}]
     flush(store)
-    check("合并：整条失败降级逐条", net.send_count() == 3, net.send_count())
-    check("合并：降级后两条都送达",
-          ls(store.sent_dir) == ["1.json", "2.json"])
+    check("合并：失败保留单一批次，不拆开重发", net.send_count() == 1, net.send_count())
+    path = os.path.join(store.pending_dir, "2.json")
+    pending = load_json(path) or {}
+    check("合并：固定正文和发送身份留队", pending.get("text") == "x1\n\nx2"
+          and pending.get("client_key") == "merged:2.json")
+    pending["next_attempt_at"] = 0
+    atomic_write_json(path, pending)
+    flush(store)
+    bodies = net.send_bodies()
+    check("合并：重试复用标识后全组送达", len(bodies) == 2
+          and bodies[0]["msg"]["client_id"] == bodies[1]["msg"]["client_id"]
+          and ls(store.sent_dir) == ["1.json", "2.json"])
 
 
 def t_fresh_group_defers():
@@ -246,9 +255,15 @@ def t_merge_probe_ok_degrades():
     net.send_script = [{"ret": -14}]
     net.probe_resp = {"ret": 0}
     r = flush(store)
-    check("合并：-14 探活正常降级逐条", r is True and net.send_count() == 3
+    check("合并：-14 探活正常保留原批次重试", r is True and net.send_count() == 1
           and not os.path.exists(store.needs_relogin_path), net.send_count())
-    check("合并：-14 降级后都送达", len(ls(store.sent_dir)) == 2)
+    path = os.path.join(store.pending_dir, "2.json")
+    pending = load_json(path) or {}
+    pending["next_attempt_at"] = 0
+    atomic_write_json(path, pending)
+    flush(store)
+    check("合并：-14 重试保持标识且全组送达", len(ls(store.sent_dir)) == 2
+          and net.send_bodies()[0]["msg"]["client_id"] == net.send_bodies()[1]["msg"]["client_id"])
 
 
 def t_merge_probe_bad():
@@ -262,7 +277,9 @@ def t_merge_probe_bad():
     r = flush(store)
     check("合并：探活 -14 判失效整组留队", r is False
           and os.path.exists(store.needs_relogin_path)
-          and len(ls(store.pending_dir)) == 2)
+          and ls(store.pending_dir) == ["2.json"]
+          and (load_json(os.path.join(store.pending_dir, "2.json")) or {}).get("merged_from")
+              == ["1.json", "2.json"])
 
 
 def main():

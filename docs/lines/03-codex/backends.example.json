@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "account_scope": "separate-codex-test-bot",
+  "default_backend": "codex",
+  "legacy_state_dir": null,
+  "job_timeout_seconds": 1800,
+  "approval_timeout_seconds": 120,
+  "backends": {
+    "codex": {
+      "instance_id": "local-codex-test-a",
+      "command": ["/absolute/path/to/codex"],
+      "cwd": "/absolute/wbridge-codex-workspace",
+      "attachment_roots": [
+        "/absolute/wbridge-codex-workspace",
+        "/absolute/wbridge-codex-test/media"
+      ],
+      "execution_policy": {"approval": "explicit", "sandbox": "workspace-write"}
+    }
+  }
+}

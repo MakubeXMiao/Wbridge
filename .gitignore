@@ -9,7 +9,28 @@ get_updates_buf.txt
 inbox/
 outbox/
 media/
+attachments/
 hooks/state/
 __pycache__/
 *.egg-info/
 wechat-bridge-backups/
+
+# Local development environments and offline evidence
+.venv/
+.pytest_cache/
+qa-results/
+
+# Local credentials, configuration and tool environments
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+.DS_Store
+.makubex-state/
+.venv-*/
+
+# Optional local worktree containers
+.worktrees/
+worktrees/
