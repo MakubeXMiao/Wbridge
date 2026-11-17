@@ -1,5 +1,7 @@
 """Offline worker/Hook protocol tests; no platform runtime or network needed."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -317,16 +319,169 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(self.state._receipt("new")["status"], "complete")
 
     def test_failed_notice_retries_without_false_confirmation(self):
+        # Keep the historical test selector used by the shell smoke runner.
         atomic_write_json(str(self.base / "outbox/failed/dead.json"), {"failed_reason": "synthetic"})
         with patch.dict(os.environ, {"WECHAT_NOTICE_RETRY_SECONDS": "1"}):
             first = self.state.plan()
+            self.assertEqual(first["reason"], "wechat_dead_letter")
             self.state.notice_result(first["payload"]["notice_keys"], False)
+            self.now += 3601
+            restarted = ws.WorkerState(str(self.base), str(self.home / "new-hook-state"),
+                                       lambda: self.now)
+            self.assertEqual(restarted.plan()["decision"], "silent")
+        row = ws.delivery_failures.status(str(self.base), "dead.json")
+        self.assertEqual(row["notice_state"], "planned")
+        self.assertIs(row["runtime_accepted"], False)
+        self.assertEqual(row["review_state"], "open")
+        self.assertIsNone(row["decision"])
+
+    def test_legacy_attempt_survives_relogin_and_prevents_duplicate_notice(self):
+        atomic_write_json(str(self.base / "outbox/failed/dead.json"), {"failed_reason": "synthetic"})
+        atomic_write_json(str(self.state.notice_path), {"failed:dead.json": {"attempts": 2}})
+        flag = Path(self.state.store.needs_relogin_path)
+        flag.write_text("synthetic")
+        self.assertEqual(self.state.plan()["reason"], "wechat_relogin_needed")
+        flag.unlink()
+        self.assertEqual(self.state.plan()["decision"], "silent")
+        self.assertNotIn("failed:dead.json", load_json(str(self.state.notice_path)))
+        row = ws.delivery_failures.status(str(self.base), "dead.json")
+        self.assertEqual(row["notice_state"], "legacy_attempted")
+        self.assertIsNone(row["runtime_accepted"])
+        self.assertEqual(row["review_state"], "open")
+
+    def test_deadletter_cli_query_and_manual_resolution_bind_original_bytes(self):
+        failure = self.base / "outbox/failed/dead.json"
+        atomic_write_json(str(failure), {"text": "synthetic body", "context_token": "synthetic token",
+                                         "delivery_outcome": "proven_unsent", "chunks_done": 1})
+        original = failure.read_bytes()
+        sha256 = hashlib.sha256(original).hexdigest()
+        journal = self.base / "state/dead_letter_reviews.json"
+        cli_state = self.home / "unused-cli-state"
+        command = [sys.executable, "-m", "wechat_bridge.worker_state", "--base", str(self.base),
+                   "--state-dir", str(cli_state)]
+
+        def call(*args):
+            return subprocess.run(command + list(args), capture_output=True, text=True, check=False)
+
+        result = call("dead-letter-status", "dead.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["sha256"], sha256)
+        self.assertEqual((observed["delivery_outcome"], observed["delivery_evidence_source"]),
+                         ("proven_unsent", "sender_failure_record"))
+        self.assertEqual((observed["accepted_text_prefix_chunks"], observed["delivery_outcome_scope"]),
+                         (1, "unresolved_suffix"))
+        self.assertNotIn("synthetic body", result.stdout)
+        self.assertNotIn("synthetic token", result.stdout)
+        self.assertFalse(journal.exists())
+        self.assertFalse(cli_state.exists())
+
+        self.assertNotEqual(call("dead-letter-reconcile", "dead.json", "--sha256", "0" * 64,
+                                 "--decision", "received").returncode, 0)
+        self.assertNotEqual(call("dead-letter-reconcile", "dead.json", "--sha256", sha256,
+                                 "--decision", "unknown").returncode, 0)
+        self.assertFalse(journal.exists())
+        planned = self.state.plan()
+        self.assertEqual(planned["reason"], "wechat_dead_letter")
+        self.state.notice_result(planned["payload"]["notice_keys"], True)
+        observed = json.loads(call("dead-letter-status", "dead.json").stdout)
+        self.assertIs(observed["runtime_accepted"], True)
+        self.assertEqual(observed["delivery_outcome"], "proven_unsent")
+
+        resolution = ("dead-letter-reconcile", "dead.json", "--sha256", sha256)
+        result = call(*resolution, "--decision", "received")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        review = json.loads(result.stdout)
+        self.assertEqual((review["review_state"], review["decision"]), ("closed", "received"))
+        self.assertEqual((review["delivery_outcome"], review["delivery_evidence_source"]),
+                         ("delivered", "human_confirmation"))
+        self.assertEqual(review["delivery_outcome_scope"], "letter")
+        self.assertEqual(json.loads(call(*resolution, "--decision", "received").stdout), review)
+        self.assertNotEqual(call(*resolution, "--decision", "discarded").returncode, 0)
+        self.assertEqual(failure.read_bytes(), original)
+        self.assertEqual(list((self.base / "outbox/pending").iterdir()), [])
+        self.assertEqual(self.state.plan()["decision"], "silent")
+
+        atomic_write_json(str(failure), {"text": "different synthetic failure"})
+        self.assertNotEqual(call(*resolution, "--decision", "received").returncode, 0)
+        self.assertEqual(self.state.plan()["reason"], "wechat_dead_letter")
+        self.assertEqual(json.loads(call("dead-letter-status", "dead.json").stdout)["review_state"],
+                         "open")
+
+    def test_deadletter_discard_preserves_sender_outcome(self):
+        failures = self.base / "outbox/failed"
+        for outcome in ("proven_unsent", "unknown"):
+            name = outcome + ".json"
+            failure = failures / name
+            atomic_write_json(str(failure), {"delivery_outcome": outcome, "text": "synthetic"})
+            original = failure.read_bytes()
+            review = ws.delivery_failures.reconcile(
+                str(self.base), name, hashlib.sha256(original).hexdigest(), "discarded", self.now)
+            self.assertEqual(review["review_state"], "closed")
+            self.assertEqual((review["delivery_outcome"], review["delivery_evidence_source"]),
+                             (outcome, "sender_failure_record"))
+            self.assertEqual(failure.read_bytes(), original)
+
+    def test_deadletter_bad_legacy_or_oversize_outcomes_stay_unknown(self):
+        failures = self.base / "outbox/failed"
+        examples = (
+            b'{"ret":0,"message_id":"synthetic","delivery_outcome":"delivered"}',
+            b'{"delivery_outcome":"proven_unsent"',
+            b'{"delivery_outcome":"unknown","delivery_outcome":"proven_unsent"}',
+            b'{"delivery_outcome":"proven_unsent","text":"' + b'x' * (1 << 20) + b'"}',
+        )
+        for index, raw in enumerate(examples):
+            name = "unverified-%d.json" % index
+            failure = failures / name
+            atomic_write_json(str(failure), {})
+            failure.write_bytes(raw)
+            review = ws.delivery_failures.status(str(self.base), name)
+            self.assertEqual(review["sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertEqual((review["delivery_outcome"], review["delivery_evidence_source"]),
+                             ("unknown", "unverified"))
+            closed = ws.delivery_failures.reconcile(
+                str(self.base), name, review["sha256"], "discarded", self.now)
+            self.assertEqual((closed["delivery_outcome"], closed["review_state"]),
+                             ("unknown", "closed"))
+
+    def test_deadletter_plan_reuses_verified_fd_stamp_but_status_reads_file(self):
+        failure = self.base / "outbox/failed/dead.json"
+        atomic_write_json(str(failure), {"delivery_outcome": "proven_unsent"})
+        self.assertEqual(self.state.plan()["reason"], "wechat_dead_letter")
+        open_private = ws.delivery_failures._private_file
+
+        @contextmanager
+        def unavailable_body(directory, name):
+            with open_private(directory, name) as (stream, info):
+                yield (None if name == "dead.json" else stream), info
+
+        with patch.object(ws.delivery_failures, "_private_file", unavailable_body):
             self.assertEqual(self.state.plan()["decision"], "silent")
-            self.now += 1
-            self.assertEqual(self.state.plan()["reason"], "wechat_dead_letter")
-        row = load_json(str(self.state.notice_path))["failed:dead.json"]
-        self.assertFalse(row["confirmed"])
-        self.assertFalse(row["last_runtime_accepted"])
+        original = ws.delivery_failures.status(str(self.base), "dead.json")["sha256"]
+        stamp = ws.delivery_failures._file_stamp(failure.stat())
+        atomic_write_json(str(failure), {"delivery_outcome": "unknown"})
+        # A stamp alone cannot resolve the actual bytes on the operator path.
+        with patch.object(ws.delivery_failures, "_file_stamp", return_value=stamp):
+            review = ws.delivery_failures.status(str(self.base), "dead.json")
+            self.assertNotEqual(review["sha256"], original)
+            self.assertEqual(review["delivery_outcome"], "unknown")
+            with self.assertRaisesRegex(ValueError, "dead_letter_digest_mismatch"):
+                ws.delivery_failures.reconcile(
+                    str(self.base), "dead.json", original, "received", self.now)
+
+    def test_deadletter_unsafe_paths_fail_closed_without_owning_inbox(self):
+        failures = self.base / "outbox/failed"
+        original = failures / "unsafe.json"
+        atomic_write_json(str(original), {"text": "synthetic"})
+        original.chmod(0o644)
+        link = failures / "alias.json"
+        link.symlink_to(original)
+        self.incoming("fresh")
+        self.assertEqual(self.state.plan()["payload"]["message_ids"], ["fresh"])
+        for name in ("../unsafe.json", "unsafe.json", "alias.json"):
+            with self.assertRaises((ValueError, OSError)):
+                ws.delivery_failures.status(str(self.base), name)
+        self.assertFalse((self.base / "state/dead_letter_reviews.json").exists())
 
     def test_deadletter_does_not_consume_new_message_lease(self):
         self.incoming("a")

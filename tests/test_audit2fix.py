@@ -169,8 +169,7 @@ def t_flusher_death_restart_recovers():
     """P1-1：flusher 被 BaseException 杀死 → 主循环重启线程 + 回收遗留。
 
     job1 的发送让假网络抛 ThreadKiller（线程当场死、job1 卡 sending/）；
-    主循环下一轮应发现并重启 flusher、先回收 job1；job1 与随后写入的
-    job2 最终都恰好成功送达一次。
+    主循环下一轮应重启 flusher，将 job1 保留待核并处理 job2。
     """
     net = RunNet(poll_cycles=30)  # 轮询 ~3s 一轮，让 sending/ 滞留可观测
     net.send_script = [ThreadKiller("boom")]
@@ -184,18 +183,17 @@ def t_flusher_death_restart_recovers():
               "sending=%s" % ls(store.sending_dir))
         write_job(store, "j2.json", text="second")
         ok2 = wait_until(
-            lambda: ls(store.sent_dir) == ["j1.json", "j2.json"]
+            lambda: ls(store.sent_dir) == ["j2.json"]
+            and ls(store.failed_dir) == ["j1.json"]
             and not ls(store.pending_dir) and not ls(store.sending_dir),
             timeout=15)
-        check("P1-1：flusher 重启后两条任务都送达且队列清空", ok2,
+        check("P1-1：flusher 重启后未知任务待核且下一条正常发送", ok2,
               "sent=%s pending=%s sending=%s" % (
                   ls(store.sent_dir), ls(store.pending_dir),
                   ls(store.sending_dir)))
-        # 两条都是 attempts=0 的文本任务，会被机械合并成一条发出——
-        # 按合并后的正文核对每条恰好出现一次（与 test_speed 同口径）。
         joined = "\n\n".join(net.send_ok_texts)
-        check("P1-1：每条正文恰好成功送达一次",
-              joined.count("first") == 1 and joined.count("second") == 1,
+        check("P1-1：未知结果不重发，下一条仅发送一次",
+              joined.count("first") == 0 and joined.count("second") == 1,
               net.send_ok_texts)
         check("P1-1：心跳文件存在且新鲜",
               os.path.exists(store.flusher_hb_path)
@@ -213,7 +211,7 @@ def t_heartbeat_stalls_when_flush_wedged():
     orig_flush = serve.flush_outbox
     gate = threading.Event()
 
-    def wedged_flush(store_, baseurl, token):
+    def wedged_flush(store_, baseurl, token, stop_event=None):
         gate.wait(30)
         return True
 

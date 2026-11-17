@@ -227,6 +227,223 @@ class RetentionTests(unittest.TestCase):
         self.store.close()
         self.assertEqual(self.apply()["deleted_files"], 0)
 
+    def _retention_schema_fixture(self, *, legacy=False, allow_null_json=False):
+        """Temporary scan fixtures, not executable PEPE attachment tasks."""
+        dbpath = self.base / "state" / "backend_jobs.sqlite3"
+        if dbpath.exists():
+            dbpath.unlink()
+        BackendState(self.store, {"synthetic": True}, "owner", "bot")
+        with sqlite3.connect(str(dbpath)) as db:
+            if legacy or allow_null_json:
+                db.execute("DROP TABLE remote_tasks")
+            if allow_null_json:
+                # Keep the known names/types/order but permit SQL NULL so the
+                # reference reader, rather than SQLite's writer, faces it.
+                db.execute("CREATE TABLE remote_tasks (execution_id TEXT, scope_id TEXT, "
+                           "request_key TEXT, task_id TEXT, identity TEXT, payload TEXT)")
+        return dbpath
+
+    def _retention_close_for_offline_scan(self):
+        # Apply may open these existing coordination files; precreate them so
+        # complete before/after tree equality also detects unintended writes.
+        for name in ("media_usage.lock", "serve.lock", "message_receipts.lock", "backend-worker.lock"):
+            path = self.base / "state" / name
+            if not path.exists():
+                path.touch(mode=0o600)
+        self.store.close()
+
+    def _assert_retention_blocked_without_mutation(self, collector=None):
+        collector = collector or self.gc()
+        before = self.snapshot()
+        preview = collector.run()
+        self.assertEqual(preview["status"], "blocked", preview)
+        self.assertEqual(preview["deleted_files"], 0, preview)
+        self.assertEqual(self.snapshot(), before)
+        applied = self.apply(collector)
+        self.assertEqual(applied["status"], "blocked", applied)
+        self.assertEqual(applied["deleted_files"], 0, applied)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_known_eight_table_empty_remote_journal_allows_offline_gc(self):
+        orphan = self.file("empty-journal-orphan.bin")
+        dbpath = self._retention_schema_fixture()
+        self._retention_close_for_offline_scan()
+        database_before = dbpath.read_bytes()
+        before = self.snapshot()
+        preview = self.gc().run()
+        self.assertEqual(preview["status"], "planned", preview)
+        self.assertEqual(preview["eligible_files"], 1, preview)
+        self.assertEqual(self.snapshot(), before)
+        applied = self.apply()
+        self.assertEqual(applied["status"], "applied", applied)
+        self.assertEqual(applied["deleted_files"], 1, applied)
+        self.assertFalse(orphan.exists())
+        self.assertEqual(dbpath.read_bytes(), database_before)
+
+    def test_legacy_seven_table_database_is_scanned_without_migration(self):
+        pin, orphan = self.file("legacy-db-pin.bin"), self.file("legacy-db-orphan.bin")
+        dbpath = self._retention_schema_fixture(legacy=True)
+        with sqlite3.connect(str(dbpath)) as db:
+            db.execute("INSERT INTO inputs VALUES (?,?,?,?,?)", (
+                "legacy-input", "owner", "message", None,
+                json.dumps({"nested": [{"text": str(pin)}]})))
+            before_tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertEqual(len(before_tables), 7)
+        self.assertNotIn("remote_tasks", before_tables)
+        self._retention_close_for_offline_scan()
+        database_before = dbpath.read_bytes()
+        before = self.snapshot()
+        preview = self.gc().run()
+        self.assertEqual(preview["status"], "planned", preview)
+        self.assertEqual(preview["eligible_files"], 1, preview)
+        self.assertEqual(self.snapshot(), before)
+        applied = self.apply()
+        self.assertEqual(applied["status"], "applied", applied)
+        self.assertEqual(applied["deleted_files"], 1, applied)
+        self.assertTrue(pin.exists())
+        self.assertFalse(orphan.exists())
+        self.assertEqual(dbpath.read_bytes(), database_before)
+        with sqlite3.connect(str(dbpath)) as db:
+            self.assertEqual({row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}, before_tables)
+
+    def test_all_remote_journal_stages_and_existing_db_json_columns_pin_media(self):
+        dbpath = self._retention_schema_fixture()
+        pins = []
+        with sqlite3.connect(str(dbpath)) as db:
+            for stage in ("prepared", "submitting", "bound"):
+                payload_pin = self.file(stage + "-payload-text-pin.bin")
+                identity_pin = self.file(stage + "-identity-only-pin.bin")
+                pins.extend((payload_pin, identity_pin))
+                # The arbitrary nested strings deliberately test conservative
+                # scanning, without claiming PEPE supports attachments.
+                identity = {"nested": [{"identity_only": {"text": str(identity_pin)}}]}
+                payload = {"state": stage, "nested": {"messages": [{"content": str(payload_pin)}]}}
+                db.execute("INSERT INTO remote_tasks VALUES (?,?,?,?,?,?)", (
+                    "fixture-" + stage, "synthetic-scope", "request-" + stage,
+                    "task-bound" if stage == "bound" else None,
+                    json.dumps(identity), json.dumps(payload)))
+            for table in ("jobs", "inputs", "outputs"):
+                pin = self.file(table + "-unpublished-reference.bin")
+                pins.append(pin)
+                raw = json.dumps({"nested": [{"text": str(pin)}]})
+                if table == "jobs":
+                    db.execute("INSERT INTO jobs VALUES (?,?,?,?)", ("fixture-job", "owner", "queued", raw))
+                elif table == "inputs":
+                    db.execute("INSERT INTO inputs VALUES (?,?,?,?,?)", (
+                        "fixture-input", "owner", "message", None, raw))
+                else:
+                    db.execute("INSERT INTO outputs VALUES (?,?,?)", ("fixture-output", "prepared", raw))
+        orphan = self.file("remote-db-orphan.bin")
+        self._retention_close_for_offline_scan()
+        database_before = dbpath.read_bytes()
+        before = self.snapshot()
+        preview = self.gc().run()
+        self.assertEqual(preview["status"], "planned", preview)
+        self.assertEqual(preview["eligible_files"], 1, preview)
+        self.assertEqual(self.snapshot(), before)
+        applied = self.apply()
+        self.assertEqual(applied["status"], "applied", applied)
+        self.assertEqual(applied["deleted_files"], 1, applied)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(all(path.exists() for path in pins))
+        self.assertEqual(len(list(self.media.iterdir())), len(pins))
+        self.assertEqual(dbpath.read_bytes(), database_before)
+
+    def test_remote_json_columns_reject_null_bad_objects_duplicates_and_nonfinite(self):
+        self.file("bad-remote-json-orphan.bin")
+        dbpath = self._retention_schema_fixture(allow_null_json=True)
+        self._retention_close_for_offline_scan()
+        bad_json = [
+            None, "{broken", "[]", '"scalar"', "1", "true", "null",
+            '{"same":1,"same":2}', '{"nested":{"same":1,"same":2}}',
+            '{"value":NaN}', '{"value":Infinity}', '{"value":-Infinity}',
+            '{"nested":[{"value":1e999}]}',
+        ]
+        for column in ("identity", "payload"):
+            for raw in bad_json:
+                with self.subTest(column=column, raw=raw):
+                    values = {"identity": "{}", "payload": "{}"}
+                    values[column] = raw
+                    with sqlite3.connect(str(dbpath)) as db:
+                        db.execute("DELETE FROM remote_tasks")
+                        db.execute("INSERT INTO remote_tasks VALUES (?,?,?,?,?,?)", (
+                            "invalid-json", "synthetic-scope", "invalid-request", None,
+                            values["identity"], values["payload"]))
+                    self._assert_retention_blocked_without_mutation()
+
+    def test_known_profiles_still_reject_unknown_schema_order_types_views_and_triggers(self):
+        self.file("unknown-schema-orphan.bin")
+        generated_pin = self.file("generated-column-only-reference.bin")
+        generated_literal = str(generated_pin).replace("'", "''")
+        self._retention_close_for_offline_scan()
+        changes = [
+            ("unknown-table", "CREATE TABLE future_state (value TEXT)"),
+            ("unknown-column", "ALTER TABLE jobs ADD COLUMN future_reference TEXT"),
+            ("wrong-type", "DROP TABLE jobs; CREATE TABLE jobs "
+                           "(id INTEGER, sender TEXT, status TEXT, payload TEXT)"),
+            ("wrong-order", "DROP TABLE jobs; CREATE TABLE jobs "
+                            "(sender TEXT, id TEXT, status TEXT, payload TEXT)"),
+            ("view", "CREATE VIEW future_view AS SELECT 1 AS value"),
+            ("trigger", "CREATE TRIGGER future_trigger AFTER INSERT ON jobs BEGIN SELECT 1; END"),
+            # table_info omits VIRTUAL generated columns, although SELECT *
+            # exposes this sole reference after the known ordinary columns.
+            ("generated-job-column", "ALTER TABLE jobs ADD COLUMN future_reference TEXT "
+                                     "GENERATED ALWAYS AS ('%s') VIRTUAL; "
+                                     "INSERT INTO jobs (id,sender,status,payload) "
+                                     "VALUES ('generated-job','owner','queued','{}')" % generated_literal),
+        ]
+        for legacy in (True, False):
+            for label, script in changes:
+                with self.subTest(legacy=legacy, change=label):
+                    dbpath = self._retention_schema_fixture(legacy=legacy)
+                    with sqlite3.connect(str(dbpath)) as db:
+                        db.executescript(script)
+                    self._assert_retention_blocked_without_mutation()
+        remote_changes = [
+            ("remote-column", "ALTER TABLE remote_tasks ADD COLUMN future_reference TEXT"),
+            ("remote-type", "DROP TABLE remote_tasks; CREATE TABLE remote_tasks "
+                            "(execution_id TEXT, scope_id TEXT, request_key TEXT, task_id TEXT, "
+                            "identity BLOB, payload TEXT)"),
+            ("remote-order", "DROP TABLE remote_tasks; CREATE TABLE remote_tasks "
+                             "(execution_id TEXT, scope_id TEXT, request_key TEXT, identity TEXT, "
+                             "task_id TEXT, payload TEXT)"),
+            ("remote-generated-column", "ALTER TABLE remote_tasks ADD COLUMN future_reference TEXT "
+                                        "GENERATED ALWAYS AS ('%s') VIRTUAL; "
+                                        "INSERT INTO remote_tasks "
+                                        "(execution_id,scope_id,request_key,task_id,identity,payload) "
+                                        "VALUES ('generated-remote','synthetic-scope','generated-request',"
+                                        "NULL,'{}','{}')" % generated_literal),
+        ]
+        for label, script in remote_changes:
+            with self.subTest(change=label):
+                dbpath = self._retention_schema_fixture()
+                with sqlite3.connect(str(dbpath)) as db:
+                    db.executescript(script)
+                self._assert_retention_blocked_without_mutation()
+
+    def test_remote_profile_keeps_wal_value_budget_and_depth_fail_closed(self):
+        self.file("remote-budget-orphan.bin")
+        dbpath = self._retention_schema_fixture()
+        self._retention_close_for_offline_scan()
+        wal = Path(str(dbpath) + "-wal")
+        wal.write_bytes(b"synthetic-not-a-live-wal")
+        self._assert_retention_blocked_without_mutation()
+        wal.unlink()
+        with sqlite3.connect(str(dbpath)) as db:
+            db.execute("INSERT INTO remote_tasks VALUES (?,?,?,?,?,?)", (
+                "budget-fixture", "synthetic-scope", "budget-request", None, "{}",
+                json.dumps({"nested": list(range(100))})))
+        with patch("wechat_bridge.media_retention.MAX_VALUES", 50):
+            self._assert_retention_blocked_without_mutation()
+        deep = {"text": "synthetic"}
+        for _ in range(18):
+            deep = {"nested": deep}
+        with sqlite3.connect(str(dbpath)) as db:
+            db.execute("UPDATE remote_tasks SET payload=?", (json.dumps(deep),))
+        self._assert_retention_blocked_without_mutation()
+
 
 if __name__ == "__main__":
     unittest.main()

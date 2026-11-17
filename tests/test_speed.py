@@ -219,9 +219,10 @@ def t_flusher_probe_relogin_stops():
         ok2 = wait_until(lambda: not t.is_alive(), timeout=15)
         check("提速：确认失效后 run 收尾返回 1",
               ok2 and result.get("rc") == 1, result)
-        check("提速：任务留队（回 pending、未送达未死信）",
-              ls(store.pending_dir) == ["p.json"]
-              and not ls(store.sent_dir) and not ls(store.failed_dir),
+        failed = load_json(os.path.join(store.failed_dir, "p.json")) or {}
+        check("提速：最终发送结果未知的死信保留",
+              not ls(store.pending_dir) and not ls(store.sent_dir)
+              and failed.get("delivery_outcome") == "unknown",
               "pending=%s sent=%s failed=%s" % (
                   ls(store.pending_dir), ls(store.sent_dir),
                   ls(store.failed_dir)))
@@ -231,7 +232,7 @@ def t_flusher_probe_relogin_stops():
 
 
 def t_flusher_probe_ok_no_relogin():
-    """发送侧 -14 但探活正常：不判失效，任务按可重试失败退避留队。"""
+    """发送侧 -14 但探活正常时服务继续，未知发送结果进入死信。"""
     net = RunNet()
     net.send_script = [{"ret": -14}]
     net.probe_resp = {"ret": 0}
@@ -240,9 +241,10 @@ def t_flusher_probe_ok_no_relogin():
     ok_flush = serve.flush_outbox(store, "https://api.invalid", "BOTTOKEN")
     check("提速：探活正常时 flush 返回 True 且不写 NEEDS_RELOGIN",
           ok_flush is True and not os.path.exists(store.needs_relogin_path))
-    j = load_json(os.path.join(store.pending_dir, "q.json")) or {}
-    check("提速：探活正常时任务记 attempts 退避留队",
-          j.get("attempts") == 1 and float(j.get("next_attempt_at") or 0) > 0,
+    j = load_json(os.path.join(store.failed_dir, "q.json")) or {}
+    check("提速：探活正常时未知任务进入死信",
+          j.get("attempts") == 1 and j.get("delivery_outcome") == "unknown"
+          and not ls(store.pending_dir),
           j)
 
 

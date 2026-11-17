@@ -38,6 +38,12 @@ class LatencyTraceTests(unittest.TestCase):
         self.calls.append(body["msg"])
         return {"message_id": len(self.calls)}
 
+    def fake_media(self, *args, **kwargs):
+        self.assertTrue(kwargs["before_send"](0, 1))
+        response = {"message_id": 10}
+        kwargs["on_result"](0, 1, response)
+        return response
+
     def put(self, **extras):
         now = time.time()
         job = dict(message_id="m2", covers_message_ids=["m1", "m2"], to_user_id="owner",
@@ -90,7 +96,8 @@ class LatencyTraceTests(unittest.TestCase):
         with patch.object(ilink, "http_json", return_value={"ret": -2}):
             _, traces = self.flush()
         self.assertEqual([t["stage"] for t in traces], ["send_started"])
-        self.assertTrue(Path(self.store.pending_dir, "m2.json").exists())
+        failed = load_json(Path(self.store.failed_dir, "m2.json"))
+        self.assertEqual(failed["delivery_outcome"], "unknown")
 
     def test_media_trace_preserves_existing_delivery_calls(self):
         path = Path(self.store.base) / "image.png"
@@ -100,7 +107,7 @@ class LatencyTraceTests(unittest.TestCase):
         job = load_json(job_path)
         job["text"] = ""
         atomic_write_json(job_path, job)
-        with patch.object(serve, "send_media_message", return_value={"message_id": 1}) as send:
+        with patch.object(serve, "send_media_message", side_effect=self.fake_media) as send:
             _, traces = self.flush()
         self.assertEqual(send.call_count, 1)
         self.assertEqual([t["stage"] for t in traces], ["send_started", "api_accepted"])
@@ -114,7 +121,7 @@ class LatencyTraceTests(unittest.TestCase):
         self.store._token_send_counts = {}
         path = Path(self.store.pending_dir) / "m2.json"
         job = load_json(path)
-        job["chunks_done"] = 1
+        job.update(chunks_done=1, delivery_state=serve._API_ACCEPTED)
         atomic_write_json(path, job)
         _, traces = self.flush()
         self.assertEqual(traces, [])
@@ -149,7 +156,7 @@ class LatencyTraceTests(unittest.TestCase):
         path = Path(self.store.base) / "image.png"
         path.write_bytes(b"synthetic")
         self.put(media_path=str(path))
-        with patch.object(serve, "send_media_message", return_value={"message_id": 2}) as send:
+        with patch.object(serve, "send_media_message", side_effect=self.fake_media) as send:
             _, traces = self.flush()
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(send.call_count, 1)
@@ -161,16 +168,45 @@ class LatencyTraceTests(unittest.TestCase):
             self.assertIn("received_at", trace)
             self.assertIn("worker_started_at", trace)
 
-    def test_transport_failure_keeps_retry_state_and_emits_no_ack(self):
+    def test_transport_failure_records_unknown_and_emits_no_ack(self):
         self.put()
-        with patch.object(ilink, "http_json", side_effect=TimeoutError("synthetic timeout")):
-            _, traces = self.flush()
+        def reset(method, url, headers, payload, **kwargs):
+            self.calls.append(payload["msg"])
+            time.sleep(0.05)
+            raise ConnectionResetError("SYNTHETIC raw /private/tmp response and credentials")
+
+        with patch.object(ilink, "http_json", side_effect=reset) as post:
+            logs, traces = self.flush()
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["retries"], 1)
         self.assertEqual([t["stage"] for t in traces], ["send_started"])
-        queued = load_json(Path(self.store.pending_dir) / "m2.json")
-        self.assertEqual(queued["attempts"], 1)
-        self.assertEqual(queued["chunks_done"], 0)
-        self.assertGreater(queued["next_attempt_at"], time.time())
-        self.assertEqual(queued["client_key"], "worker:m2")
+        timings = [json.loads(line.split("text_send ", 1)[1])
+                   for line in logs.splitlines() if "text_send " in line]
+        self.assertEqual(len(timings), 1)
+        timing = timings[0]
+        self.assertEqual(set(timing), {"schema_version", "stage", "outcome", "unit_id",
+                                      "chunk_index", "chunks_total", "elapsed_ms"})
+        self.assertEqual((timing["stage"], timing["outcome"], timing["chunk_index"], timing["chunks_total"]),
+                         ("sendmessage", "transport_error", 0, 1))
+        self.assertEqual(timing["unit_id"], self.calls[0]["client_id"])
+        self.assertGreaterEqual(timing["elapsed_ms"], 45)
+        for secret in (self.secret_body, self.secret_context, self.secret_lease, "FAKE-PRIVATE-TOKEN",
+                       "api.invalid", "/private/tmp response", "worker:m2"):
+            self.assertNotIn(secret, logs)
+        failed = load_json(Path(self.store.failed_dir) / "m2.json")
+        self.assertEqual(failed["attempts"], 1)
+        self.assertEqual(failed.get("chunks_done", 0), 0)
+        self.assertEqual(failed["delivery_outcome"], "unknown")
+        self.assertEqual(failed["client_key"], "worker:m2")
+        self.assertFalse(Path(self.store.pending_dir, "m2.json").exists())
+
+
+    def test_text_post_diagnostic_failure_preserves_api_response(self):
+        with patch.object(ilink, "log", side_effect=OSError("synthetic log failure")):
+            result = ilink.send_message("https://api.invalid", "FAKE", "owner", "synthetic", "",
+                                        client_key="probe", pace=0)
+        self.assertEqual(result["_chunks_done"], 1)
+        self.assertEqual(len(self.calls), 1)
 
 
 if __name__ == "__main__":

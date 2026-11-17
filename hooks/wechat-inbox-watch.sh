@@ -21,13 +21,66 @@ if [ "${WECHAT_HOOK_LOCKED:-0}" != 1 ]; then
     lock-run --lock "$STATE_DIR/wechat_inbox_watch.lock" -- bash "$0"
 fi
 
+# Keep the trusted runtime's adapter override, then apply the private switch
+# configuration so runtime exports cannot overwrite its selected values.
 source "$HATCH_HOOK_RUNTIME"
+
+# Both the Hook and independently started Worker adapter read this private
+# deployment configuration. Message payloads cannot select names or values.
+ADAPTER="${WECHAT_MUSE_ADAPTER:-$(cd -- "$(dirname -- "$0")" && pwd -P)/muse-worker.py}"
+RUNTIME_CONFIG="$STATE_DIR/muse-adapter/runtime-switches.json"
+runtime_environment_failed() {
+  echo '{"stage":"muse_runtime_environment","status":"invalid_configuration"}' >&2
+  exit 1
+}
+if [ -e "$RUNTIME_CONFIG" ] || [ -L "$RUNTIME_CONFIG" ]; then
+  runtime_environment="$("$PYTHON" "$ADAPTER" --base "$BASE" --state-dir "$STATE_DIR" \
+    --runtime-environment 2>/dev/null)" || runtime_environment_failed
+  runtime_exports="$("$PYTHON" -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+    names = ("WECHAT_REFERENCE_V2", "WECHAT_CDN_TIER_TRIAL",
+             "WECHAT_RECENT_CONTEXT", "WECHAT_CLOUD_CONTEXT")
+    environment = value["environment"]
+    if (type(value) is not dict or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1 or value.get("configured") is not True
+            or type(environment) is not dict or set(environment) != set(names)
+            or any(type(environment[name]) is not str or environment[name] not in ("0", "1")
+                   for name in names)):
+        sys.exit(1)
+    print("\n".join(name + "=" + environment[name] for name in names))
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+' <<< "$runtime_environment")" || runtime_environment_failed
+  while IFS= read -r assignment; do
+    export "$assignment"
+  done <<< "$runtime_exports"
+fi
+
+# First rollout permits only this synthetic source. The exact same trusted
+# binding goes to program maintenance and Worker adapter invocations.
+# Guarded array expansion below supports empty arrays under Bash 3 nounset.
+context_args=()
+if [ "${WECHAT_CLOUD_CONTEXT:-0}" = 1 ]; then
+  context_args=(--cloud-source-id wbridge-synthetic --cloud-case-id continuity-smoke
+                --cloud-publisher-id wbridge-synthetic-publisher)
+fi
 
 serve_alive=1
 if [ -f "$BASE/state/session.json" ] && [ ! -f "$BASE/state/NEEDS_RELOGIN" ]; then
   health="$("$PYTHON" -m wechat_bridge.worker_state --base "$BASE" --state-dir "$STATE_DIR" \
-    supervise --executable "${WECHAT_BRIDGE_EXECUTABLE:-$HOME/workspace/wechat-bridge-venv/bin/wechat-bridge}" 2>/dev/null)" || health='{"alive":false}'
+    supervise --executable "${WECHAT_BRIDGE_EXECUTABLE:-$HOME/workspace/wechat-bridge-venv/bin/wechat-bridge}" \
+    ${context_args[@]+"${context_args[@]}"} 2>/dev/null)" || health='{"alive":false}'
   serve_alive="$("$PYTHON" -c 'import json,sys; print(1 if json.load(sys.stdin).get("alive") else 0)' <<< "$health")"
+else
+  # Supervise owns normal-path maintenance. Closed login gates still clean
+  # expired context once, including when injection is disabled. Old packages
+  # can lack this optional command without changing the existing Hook plan.
+  if ! "$PYTHON" -m wechat_bridge.worker_state --base "$BASE" \
+    recent-context-maintain ${context_args[@]+"${context_args[@]}"} >/dev/null 2>&1; then
+    echo '{"stage":"recent_context_maintenance","status":"unavailable"}' >&2
+  fi
 fi
 if [ "$serve_alive" = 1 ]; then
   plan="$("$PYTHON" -m wechat_bridge.worker_state --base "$BASE" --state-dir "$STATE_DIR" plan)"
@@ -43,7 +96,6 @@ if [ "$decision" != wake ]; then
 fi
 # Adapter paths come from the installed Hook, never from message contents.
 # A missing companion must fail visibly, not fall back to model-written outbox.
-ADAPTER="${WECHAT_MUSE_ADAPTER:-$(cd -- "$(dirname -- "$0")" && pwd -P)/muse-worker.py}"
 if [ "$reason" = new_wechat_message ] && [ ! -f "$ADAPTER" ]; then
   echo '{"stage":"muse_adapter_missing","must_stop":true}' >&2
   exit 1
@@ -54,8 +106,10 @@ p=json.load(sys.stdin)
 a=pathlib.Path(sys.argv[1]).resolve()
 p["muse_adapter"]={"path":str(a),"protocol":1,
     "sha256":hashlib.sha256(a.read_bytes()).hexdigest() if a.is_file() else None}
+if sys.argv[2:]:
+    p["muse_adapter"]["context_argv"]=sys.argv[2:]
 print(json.dumps(p,ensure_ascii=False))
-' "$ADAPTER" <<< "$payload")"
+' "$ADAPTER" ${context_args[@]+"${context_args[@]}"} <<< "$payload")"
 # These timestamps observe the wake call only. A successful return is not
 # proof that a platform worker started, adopted a batch, or delivered a reply.
 wake_at="$("$PYTHON" -c 'import time; print(time.time())')"

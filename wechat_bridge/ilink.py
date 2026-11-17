@@ -63,13 +63,19 @@ def http_json(method, url, headers, body=None, timeout=40, retries=3):
     h = {"Accept": "*/*", "User-Agent": "Mozilla/5.0 (compatible; wechat-bridge/1.0)"}
     h.update(headers or {})
     last_err = None
+    final_send = url.endswith("/ilink/bot/sendmessage")
+    http_error = False
     for attempt in range(retries):
         req = urllib.request.Request(url, data=data, headers=h, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", None)
+                if final_send and status is not None:
+                    http_error = type(status) is not int or not 200 <= status < 300
                 raw = resp.read()
             break
         except urllib.error.HTTPError as e:
+            http_error = True
             raw = e.read()  # HTTP 错误响应也带业务体，不重试
             break
         except (http.client.RemoteDisconnected, http.client.HTTPException,
@@ -81,13 +87,35 @@ def http_json(method, url, headers, body=None, timeout=40, retries=3):
             raise
     else:
         raise last_err
-    text = raw.decode("utf-8", "replace")
-    if not text.strip():
-        return {}
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"_raw": text[:500]}
+        text = raw.decode("utf-8", "strict" if final_send else "replace")
+        if not text.strip():
+            result = {}
+        elif final_send:
+            result = json.loads(text, object_pairs_hook=_unique_object,
+                                parse_constant=_reject_non_json_number)
+        else:
+            result = json.loads(text)
+    except (UnicodeDecodeError, ValueError):
+        result = {"_raw": "invalid send response" if final_send else text[:500]}
+    if final_send and http_error:
+        if not isinstance(result, dict):
+            result = {}
+        result["_http_error"] = True
+    return result
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate response field")
+        result[key] = value
+    return result
+
+
+def _reject_non_json_number(value):
+    raise ValueError("non-finite response value")
 
 
 def is_token_invalid(resp):
@@ -98,21 +126,23 @@ def is_token_invalid(resp):
 
 
 def resp_ok(resp, kind="send"):
-    """成功判据（P4，2026-10-21 实测修正）。
-
-    实测 iLink 的 sendmessage 成功响应是 {"message_id": ...}，根本没有 ret；
-    getuploadurl 成功响应带 upload_full_url/upload_param，也可能没有 ret。
-    初版按「必须 ret==0」判，把已送达的消息当失败重试、造成重复发送，已改：
-    有 ret 时以 ret==0 为准；没有 ret 时看接口的成功标志字段；
-    无 ret 又无成功标志、或是非 JSON 的 _raw 体，才算可重试失败。
-    """
+    """Recognize the existing upload responses and affirmative send acknowledgements."""
     if not isinstance(resp, dict) or "_raw" in resp:
         return False
-    if resp.get("ret") is not None:
-        return resp.get("ret") == 0
     if kind == "upload":
+        if resp.get("ret") is not None:
+            return resp.get("ret") == 0
         return bool(resp.get("upload_full_url") or resp.get("upload_param"))
-    return resp.get("message_id") is not None
+    if "_http_error" in resp:
+        return False
+    for field in ("ret", "errcode"):
+        if field in resp and (type(resp[field]) is not int or resp[field] != 0):
+            return False
+    if "message_id" in resp:
+        message_id = resp["message_id"]
+        return ((type(message_id) is int and message_id > 0)
+                or (type(message_id) is str and bool(message_id.strip())))
+    return resp.get("ret") == 0
 
 
 def split_text(text, max_runes=MAX_TEXT_RUNES):
@@ -133,6 +163,19 @@ def _stable_client_id(client_key, chunk_index):
     """
     seed = ("%s#%d" % (client_key or "", chunk_index)).encode("utf-8")
     return hashlib.md5(seed).hexdigest()
+
+
+def _trace_text_post(unit_id, index, total, started, response=None, *, transport_error=False):
+    """Report elapsed time for a performed text POST, independently of settlement."""
+    try:
+        outcome = ("transport_error" if transport_error else
+                   "api_accepted" if resp_ok(response) else "response_unconfirmed")
+        row = {"schema_version": 1, "stage": "sendmessage", "outcome": outcome,
+               "unit_id": unit_id, "chunk_index": index, "chunks_total": total,
+               "elapsed_ms": round(max(0, time.monotonic() - started) * 1000, 3)}
+        log("text_send " + json.dumps(row, separators=(",", ":"), allow_nan=False))
+    except Exception:
+        pass  # Telemetry never determines delivery or retry.
 
 
 def send_message(baseurl, token, to_user_id, text, context_token, start_chunk=0,
@@ -190,12 +233,21 @@ def send_message(baseurl, token, to_user_id, text, context_token, start_chunk=0,
             # 二次审查 P3-6：sendmessage 关掉传输层自动重试（retries=1)。
             # 旧默认 retries=3：服务端已收下、连接才断时，传输层会拿同一
             # 请求再打两次，是否重复投递全靠服务端按 client_id 去重——
-            # 未验证、不该赌。改单次尝试：连接错误立刻抛给调用方，由任务
-            # 层退避重试（带稳定的 client_id 派生），恢复路径明确可控。
+            # 最终请求失败由调用方按未知结算，保留已确认前缀。
             # getupdates/探活保持默认重试（轮询幂等、无投递副作用）。
-            last_resp = (http_json("POST", baseurl + "/ilink/bot/sendmessage",
-                                  auth_headers(token), payload, timeout=30, retries=1)
-                         if send_allowed is not False else {"ret": 0, "_locally_accepted": True})
+            if send_allowed is False:
+                last_resp = {"ret": 0, "_locally_accepted": True}
+            else:
+                headers = auth_headers(token)
+                started = time.monotonic()
+                unit_id = payload["msg"]["client_id"]
+                try:
+                    last_resp = http_json("POST", baseurl + "/ilink/bot/sendmessage",
+                                          headers, payload, timeout=30, retries=1)
+                except Exception:
+                    _trace_text_post(unit_id, i, total, started, transport_error=True)
+                    raise
+                _trace_text_post(unit_id, i, total, started, last_resp)
         except Exception as e:
             # 审查第 3 项：把已送达片数挂在异常上带出，调用方据此落盘
             e._chunks_done = done_so_far
@@ -207,7 +259,7 @@ def send_message(baseurl, token, to_user_id, text, context_token, start_chunk=0,
         if on_result is not None:
             on_result(i, total, last_resp)
         if is_token_invalid(last_resp) or not resp_ok(last_resp):
-            last_resp["_chunks_done"] = i  # 第 i 片没发出去，续发从 i 开始
+            last_resp["_chunks_done"] = i  # 第 i 片的结果未获确认。
             last_resp["_chunks_total"] = total
             return last_resp
         done_so_far = i + 1

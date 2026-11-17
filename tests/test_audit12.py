@@ -133,24 +133,15 @@ def t_fix1_recovery():
     net = FakeNet()
     store = fresh_store(net)
     write_job(store, "stuck.json", where="sending", attempts=2,
-              next_attempt_at=time.time() + 9999,
-              delivery_state="inflight")
-    # Every serial flush now recovers abandoned sending files, but a committed
-    # retry schedule must not be erased by source-cleanup recovery.
+              next_attempt_at=time.time() + 9999, delivery_state="inflight")
     flush(store)
-    check("F1 flush自动回收sending且保留退避",
-          net.send_count() == 0 and ls(store.sending_dir) == []
-          and ls(store.pending_dir) == ["stuck.json"])
     serve._recover_sending(store)
-    check("F1 回收后任务回到 pending", ls(store.pending_dir) == ["stuck.json"]
-          and ls(store.sending_dir) == [])
-    j = load_json(os.path.join(store.pending_dir, "stuck.json"))
-    check("F1 回收保留attempts和已持久退避",
-          j.get("attempts") == 2 and j.get("next_attempt_at") > time.time(), j)
-    j["next_attempt_at"] = 0
-    atomic_write_json(os.path.join(store.pending_dir, "stuck.json"), j)
     flush(store)
-    check("F1 回收后任务正常发出", ls(store.sent_dir) == ["stuck.json"])
+    failed = load_json(os.path.join(store.failed_dir, "stuck.json")) or {}
+    check("F1 旧在途任务留原记录待核且不重发",
+          net.send_count() == 0 and not ls(store.sending_dir)
+          and not ls(store.pending_dir) and failed.get("attempts") == 2
+          and failed.get("delivery_outcome") == "unknown", failed)
 
 
 def t_fix1_status_counts_sending():
@@ -190,9 +181,11 @@ def t_fix3_serve_persists_progress():
     write_job(store, "long.json", text="a" * 4500)
     net.send_script = [{"message_id": 1}, ConnectionError("boom")]
     flush(store)
-    j = load_json(os.path.join(store.pending_dir, "long.json")) or {}
-    check("F3 serve 异常分支落盘 chunks_done=1",
-          j.get("chunks_done") == 1 and j.get("attempts") == 1, j)
+    j = load_json(os.path.join(store.failed_dir, "long.json")) or {}
+    flush(store)
+    check("F3 已确认前缀落盘且后缀待核不重发",
+          j.get("chunks_done") == 1 and j.get("attempts") == 1
+          and j.get("delivery_outcome") == "unknown" and net.send_count() == 2, j)
 
 
 def t_fix3_stable_client_id():
@@ -233,9 +226,13 @@ def t_fix4_caption_retry_defers_media():
     flush(store)
     kinds = net.send_kinds()
     check("F4 配文失败时媒体不抢跑", kinds == ["text:captext"], kinds)
-    check("F4 配文与媒体都回 pending 等重试",
-          "m_caption.json" in ls(store.pending_dir)
-          and "m.json" in ls(store.pending_dir), ls(store.pending_dir))
+    caption = load_json(os.path.join(store.failed_dir, "m_caption.json")) or {}
+    parent = load_json(os.path.join(store.failed_dir, "m.json")) or {}
+    flush(store)
+    check("F4 配文待核且媒体确证未发",
+          caption.get("delivery_outcome") == "unknown"
+          and parent.get("delivery_outcome") == "proven_unsent"
+          and net.send_count() == 1)
 
 
 def t_fix4_caption_dead_media_follows():
@@ -482,7 +479,7 @@ def t_fix12_corrupt_isolated():
     with open(junk, "w", encoding="utf-8") as f:
         f.write("{not json")
     os.utime(junk, (old, old))
-    write_job(store, "good.json", text="good", attempts=1)
+    write_job(store, "good.json", text="good")
     flush(store)
     failed = ls(store.failed_dir)
     check("F12 坏文件被隔离到 failed",

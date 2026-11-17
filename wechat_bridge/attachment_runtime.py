@@ -9,11 +9,12 @@ import time
 import uuid
 import stat
 
-from .store import atomic_write_json, load_json, safe_message_id
+from .store import atomic_write_json, atomic_write_text, load_json, safe_message_id
 from .progress import OperationAborted
 
 CAPABILITIES = {"schema_version": 1, "protocol": "attachment_inbox_v1", "version": 1,
-    "features": ["attachments_v1", "references_v1", "attachment_groups_v1", "attachment_labels_v1", "attachment_cancel_v1"],
+    "features": ["attachments_v1", "references_v1", "attachment_groups_v1", "attachment_labels_v1", "attachment_cancel_v1",
+                 "references_v2"],
     "limits": {"request_bytes": 65536, "response_bytes": 65536, "query_limit": 20,
                "attachment_ids": 16, "reference_ordinals": 16}}
 PUBLIC_METADATA = ("attachment_id", "message_id", "item_index", "received_at", "kind",
@@ -268,6 +269,44 @@ def initialize(store):
     return scope
 
 
+def reference_v2_enabled():
+    return os.environ.get("WECHAT_REFERENCE_V2") == "1"
+
+
+_REFERENCE_GENERATION = "reference-v2-generation"
+
+
+def reference_continuity_active(store):
+    return reference_v2_enabled() or os.path.lexists(os.path.join(store.state_dir, _REFERENCE_GENERATION))
+
+
+def _reference_generation(store):
+    path = os.path.join(store.state_dir, _REFERENCE_GENERATION)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size != 32):
+            raise AttachmentCallError("storage_invalid")
+        value = os.read(fd, 33)
+        if not re.fullmatch(rb"[0-9a-f]{32}", value):
+            raise AttachmentCallError("storage_invalid")
+        return value.decode("ascii")
+    finally:
+        os.close(fd)
+
+
+def break_reference_group(store):
+    """Persist a continuity fence before acknowledging an uncatalogued event."""
+    _reference_generation(store)  # A malformed existing marker needs reconciliation.
+    generation = uuid.uuid4().hex
+    atomic_write_text(os.path.join(store.state_dir, _REFERENCE_GENERATION), generation)
+    return generation
+
+
 def receive_event(store, msg, sender, items, text, received_at):
     if not active(store):
         return None
@@ -275,8 +314,11 @@ def receive_event(store, msg, sender, items, text, received_at):
         raise AttachmentCallError("storage_invalid")
     scope = current_scope(store, sender)
     ledger(store).register_context(scope, msg.get("context_token") or "", fresh=True)
-    event = catalog(store).register_event(scope, str(msg["message_id"]), items,
-                                          text=text, received_at=received_at)
+    enabled = reference_v2_enabled()
+    generation = (_reference_generation(store) or break_reference_group(store)) if enabled else None
+    event = catalog(store).register_event(
+        scope, str(msg["message_id"]), items, text=text, received_at=received_at,
+        reference_v2=enabled, reference_generation=generation)
     return scope, event
 
 
@@ -341,6 +383,17 @@ def _reference_identity(value):
     result["members"] = [{k: slot.get(k) for k in ("ordinal", "message_id", "item_index", "attachment_id")}
                          for slot in value.get("slots", [])]
     return result
+
+
+def _reference_v2_identity(value):
+    identity = _reference_identity(value)
+    identity.update({key: value.get(key) for key in (
+        "first_event_seq", "last_member_seq", "membership_digest", "position_limit",
+        "attachment_count", "candidate_position_count", "overflow")})
+    identity["members"] = [{key: slot.get(key) for key in (
+        "ordinal", "message_id", "item_index", "attachment_id", "event_seq", "kind",
+        "received_at")} for slot in value.get("slots", [])]
+    return identity
 
 
 def _explicit_continue(batch):
@@ -478,7 +531,8 @@ def _resume_admitted_job(store, scope, record, path, check_authority):
                 state.group_status(scope, job["group_id"], maintenance=False))}
 
 
-def _admit(worker, scope, batch, claims, request_id, group_id=None, ids=None, caption=""):
+def _admit(worker, scope, batch, claims, request_id, group_id=None, ids=None, caption="",
+           _context_capture=None):
     from .attachments import AttachmentError
     def check_authority():
         if any(not worker._alive(mid, claims[mid]) for mid in batch["owned"]):
@@ -519,6 +573,12 @@ def _admit(worker, scope, batch, claims, request_id, group_id=None, ids=None, ca
         result = None if fresh else _resume_admitted_job(store, scope, record, str(path), check_authority)
         if result is None:
             result = publish_admission(store, record, str(path), check_authority)
+        if _context_capture is not None:
+            try:
+                _context_capture(scope, batch["messages"], {"kind": "attachment",
+                    "job_id": result["job_id"], "group_id": result["group_id"]}, caption)
+            except Exception:
+                pass
         worker._complete(batch["owned"], claims)
     except Exception as error:
         if getattr(error, "code", None) in ("lease_lost", "epoch_mismatch"):
@@ -613,7 +673,7 @@ def covered_attachment(store, mid):
     return None
 
 
-def worker_call(worker, ids, lease, request):
+def worker_call(worker, ids, lease, request, _context_capture=None):
     action = request.get("action") if type(request) is dict else None
     try:
         if type(request) is not dict or type(request.get("schema_version")) is not int or request["schema_version"] != 1:
@@ -622,7 +682,7 @@ def worker_call(worker, ids, lease, request):
             raise AttachmentCallError("invalid_request")
         if len(json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 65536:
             raise AttachmentCallError("invalid_request")
-        if action not in ("query", "get", "reference", "release", "pin", "label", "reply", "continue", "cancel", "status"):
+        if action not in ("query", "get", "reference", "reference_v2", "release", "pin", "label", "reply", "continue", "cancel", "status"):
             raise AttachmentCallError("unsupported_action")
         args = request["arguments"]
         with worker.locked():
@@ -672,6 +732,25 @@ def worker_call(worker, ids, lease, request):
                     raise AttachmentCallError("scope_mismatch")
                 raw = files.resolve_reference(scope, sid, args.get("ordinals"), holder=holder)
                 result = {k: raw[k] for k in ("reference_context", "materials", "unavailable", "complete")}
+            elif action == "reference_v2":
+                _keys(args, ("text_message_id", "snapshot_id"), ("ordinals",))
+                mid = _identifier(args["text_message_id"])
+                sid = _identifier(args["snapshot_id"])
+                bound = records.get(mid, {}).get("reference_context_v2")
+                if mid not in batch["owned"] or type(bound) is not dict or bound.get("snapshot_id") != sid:
+                    raise AttachmentCallError("scope_mismatch")
+                ordinals = args.get("ordinals")
+                if "ordinals" in args and ordinals is None:
+                    raise AttachmentCallError("invalid_request")
+                observed = files.resolve_reference_v2(scope, mid, sid, ordinals)
+                context = observed["reference_context_v2"]
+                if _reference_v2_identity(bound) != _reference_v2_identity(context):
+                    raise AttachmentCallError("scope_mismatch")
+                if ordinals is None:
+                    result = {"reference_context_v2": context, "materials": [],
+                              "unavailable": [], "complete": True}
+                else:
+                    result = files.resolve_reference_v2(scope, mid, sid, ordinals, holder=holder)
             elif action == "release":
                 _keys(args, ("hold_id",))
                 files.release(scope, _identifier(args["hold_id"]), holder=holder)
@@ -718,7 +797,8 @@ def worker_call(worker, ids, lease, request):
                 if any(not worker._alive(mid, claims[mid]) for mid in batch["owned"]):
                     raise AttachmentCallError("lease_lost")
                 request_id = "reply-" + _digest(batch["owned"])
-                result = _admit(worker, scope, batch, claims, request_id, ids=aids, caption=caption)
+                result = _admit(worker, scope, batch, claims, request_id, ids=aids, caption=caption,
+                                _context_capture=_context_capture)
             elif action == "continue":
                 _keys(args, ("group_id",))
                 if not _explicit_continue(batch):
@@ -727,7 +807,8 @@ def worker_call(worker, ids, lease, request):
                 _require_group_choice(ledger(worker.store), scope, group_id,
                     "\n".join(row.get("text") or "" for row in batch["messages"]))
                 request_id = "continue-" + _digest(batch["owned"])
-                result = _admit(worker, scope, batch, claims, request_id, group_id=group_id)
+                result = _admit(worker, scope, batch, claims, request_id, group_id=group_id,
+                                _context_capture=_context_capture)
             elif action == "cancel":
                 _keys(args, ("text_message_id", "group_id"))
                 mid = _identifier(args["text_message_id"])
@@ -788,35 +869,45 @@ class SendBudget:
             raise OperationAborted("epoch_mismatch")
 
     def before(self, index, total):
-        self.check()
-        unit_id = "legacy-" + _digest([self.key, index])
+        if self.prepare(index) == "accepted":
+            return False
         try:
-            self.state.reserve_units(self.scope, self.context, [unit_id])
-            item = self.state.begin_reserved(self.scope, self.context, unit_id)
+            item = self.state.begin_reserved(self.scope, self.context, self.current)
         except Exception as error:
-            if getattr(error, "code", None) in ("budget_exhausted", "group_unknown"):
-                raise BudgetUnavailable(error.code) from None
+            if getattr(error, "code", None) in ("group_busy", "group_unknown"):
+                self.current = None
+                raise BudgetUnavailable("group_unknown") from None
             raise
-        self.current, self.inflight = unit_id, item["send_allowed"]
-        return item["send_allowed"]
+        self.inflight = item["send_allowed"]
+        if not self.inflight:
+            self.current = None
+        return self.inflight
 
     def prepare(self, index=0):
         self.check()
-        self.current = "legacy-" + _digest([self.key, index])
+        unit_id = "legacy-" + _digest([self.key, index])
         try:
-            reservation = self.state.reserve_units(self.scope, self.context, [self.current])
+            reservation = self.state.reserve_units(self.scope, self.context, [unit_id])
         except Exception as error:
             if getattr(error, "code", None) in ("budget_exhausted", "group_unknown"):
-                self.current = None
+                if error.code == "group_unknown":
+                    self.current = None
                 raise BudgetUnavailable(error.code) from None
             raise
-        return reservation["units"][0]["state"]
+        state = reservation["units"][0]["state"]
+        if state == "inflight":
+            self.current = None
+            raise BudgetUnavailable("group_unknown")
+        self.current = unit_id if state == "reserved" else None
+        return state
 
     def result(self, index, total, response):
         from .ilink import resp_ok
         if self.current is not None:
+            self.check()
             self.state.settle_reserved(self.scope, self.context, self.current,
                                        "accepted" if resp_ok(response) else "unknown")
+            self.current = None
         self.inflight = False
 
     def abort(self):
@@ -825,6 +916,7 @@ class SendBudget:
                 self.state.settle_reserved(self.scope, self.context, self.current,
                                           "unknown" if self.inflight else "proven_unsent")
             finally:
+                self.current = None
                 self.inflight = False
 
 
@@ -1002,10 +1094,10 @@ def _reconcile_terminal_holds(store, scope, active_requests=()):
         store._attachment_terminal_cursor = name
 
 
-def flush_groups(store, baseurl, token):
+def flush_groups(store, baseurl, token, stop_event=None):
     """Only the public sender runs this; no latest-context upgrade path."""
     from .ilink import ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, send_message, resp_ok
-    from .media import send_media_message
+    from .media import send_media_message, MediaSendError, supervised_cdn_options
     from .store import log
     if not active(store):
         return
@@ -1033,12 +1125,17 @@ def flush_groups(store, baseurl, token):
             log("附件任务admission未完成或连接不符，保留并跳过本轮", job=job_id)
             continue
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return
             unit = state.next_unit(scope, job_id)
             if unit is None:
                 break
             started = [False]
             settled = [False]
+            delivery_stage = ["index_acquire"]
             def check():
+                if stop_event is not None and stop_event.is_set():
+                    raise OperationAborted("cancelled")
                 try:
                     current_scope_value = current_scope(store)
                 except AttachmentCallError:
@@ -1048,16 +1145,30 @@ def flush_groups(store, baseurl, token):
                 current = state.job_status(scope, job_id)
                 if current["state"] not in ("queued", "sending"):
                     raise OperationAborted("expired" if current["state"] == "expired" else "cancelled")
+                if current["fence"] != unit["fence"]:
+                    raise OperationAborted("lease_lost")
             def before(index, total):
+                delivery_stage[0] = "sendmessage"
                 check()
                 claimed = state.begin_unit(scope, job_id, unit["unit_id"])
                 started[0] = claimed["send_allowed"]
+                if started[0]:
+                    check()
                 return claimed["send_allowed"]
             def result(index, total, response):
+                delivery_stage[0] = "settle"
+                if started[0]:
+                    try:
+                        same_scope = current_scope(store) == scope
+                    except AttachmentCallError:
+                        same_scope = False
+                    if not same_scope or _session(store).get("bot_token") != token:
+                        raise OperationAborted("epoch_mismatch")
                 state.settle_unit(scope, job_id, unit["unit_id"], "accepted" if resp_ok(response) else "unknown")
                 settled[0] = True
             progress = stage_progress(store, check)
             try:
+                check()
                 if unit["kind"] == "attachment":
                     material = files.acquire(scope, unit["attachment_id"], "group:" + unit["group_id"])
                     meta = material["metadata"]
@@ -1069,11 +1180,15 @@ def flush_groups(store, baseurl, token):
                         if event["stage"] == "send_after":
                             stage_progress(store)(event)
                         else:
+                            if event["stage"] == "upload":
+                                delivery_stage[0] = "upload"
                             progress(event)
+                    delivery_stage[0] = "file_read"
                     response = send_media_message(baseurl, token, scope["owner_id"], context,
                         material["path"], item_type, client_key=unit["client_key"],
                         progress=media_progress, before_send=before, on_result=result,
-                        file_name=_safe_name(meta))
+                        file_name=_safe_name(meta), **supervised_cdn_options(
+                            store, unit["client_key"], check, unit["expires_at"]))
                 else:
                     response = send_message(baseurl, token, scope["owner_id"], unit["text"], context,
                         client_key=unit["client_key"], pace=0, before_send=before, on_result=result)
@@ -1088,7 +1203,16 @@ def flush_groups(store, baseurl, token):
                         state.settle_unit(scope, job_id, unit["unit_id"], "unknown" if started[0] else "proven_unsent")
                     except Exception:
                         pass  # Durable inflight is reconciled to unknown at restart.
-                log("附件发送单元暂停（reason=%s）" % getattr(error, "code", "operation_failed"))
+                code = getattr(error, "code", "operation_failed")
+                if isinstance(error, MediaSendError):
+                    phase, code = error.stage, error.code
+                else:
+                    phase = delivery_stage[0]
+                    code = code if code in ERRORS else "operation_failed"
+                # Exact public unit identity links finite media phases to ledger
+                # state; no path, context, response or raw exception is logged.
+                log("附件发送单元暂停（stage=%s reason=%s unit=%s）" %
+                    (phase, code, unit["unit_id"]), job=job_id)
                 break
         status = state.group_status(scope, job["group_id"])
         if status["state"] in ("complete", "cancelled"):

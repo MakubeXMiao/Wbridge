@@ -15,7 +15,7 @@ from .contract import BackendError
 _ROOT_KEYS = frozenset(("schema_version", "account_scope", "default_backend",
                         "legacy_state_dir", "job_timeout_seconds",
                         "approval_timeout_seconds", "backends"))
-_PROVIDERS = frozenset(("codex", "claude_code"))
+_PROVIDERS = frozenset(("codex", "claude_code", "pepe"))
 _BACKENDS = _PROVIDERS | frozenset(("muse",))
 _DRIVER_METHODS = ("start", "poll", "respond_approval", "cancel", "close")
 
@@ -47,6 +47,9 @@ def _selected(backend_id, selected, check_runtime):
         if selected:
             raise BackendError("muse configuration must be {}; use legacy_state_dir")
         return result
+    if backend_id == "pepe":
+        from ..pepe_core import validate_pepe_config
+        return validate_pepe_config(result)
     if not _nonempty(result.get("instance_id")):
         raise BackendError("backend instance_id is required and must be bounded")
     command = result.get("command")
@@ -95,12 +98,14 @@ def validate_config(config, check_runtime=True):
     backends = config.get("backends")
     if (not isinstance(backends, dict) or not backends
             or any(not isinstance(key, str) or key not in _BACKENDS for key in backends)):
-        raise BackendError("backends must enable codex, claude_code and/or muse")
+        raise BackendError("backends must enable codex, claude_code, pepe and/or muse")
     default = config.get("default_backend")
     if not isinstance(default, str) or default not in backends:
         raise BackendError("default_backend must name an enabled backend")
     result = copy.deepcopy(config)
     result["job_timeout_seconds"] = _integer(config, "job_timeout_seconds", 1800, 86400)
+    if "pepe" in backends and result["job_timeout_seconds"] < 66:
+        raise BackendError("pepe job_timeout_seconds must allow at least 66 seconds for the remote TTL and rounding")
     result["approval_timeout_seconds"] = _integer(config, "approval_timeout_seconds", 300, 300)
     legacy = config.get("legacy_state_dir")
     if "muse" in backends and legacy is None:
@@ -155,7 +160,7 @@ def load_config(store):
 
 def _factory(backend_id):
     if not isinstance(backend_id, str) or backend_id not in _PROVIDERS:
-        raise BackendError("only codex and claude_code have a v1 backend factory")
+        raise BackendError("only codex, claude_code and pepe have a v1 backend factory")
     try:
         module = importlib.import_module(".%s" % backend_id, package=__package__)
     except Exception:
@@ -231,6 +236,13 @@ def preflight(store, config, session):
         providers.append({"backend_id": backend_id,
                           "adapter": "legacy_hook" if backend_id == "muse" else "available",
                           "provider_auth": "not_checked"})
+        if backend_id == "pepe":
+            native = config["backends"][backend_id]["execution_policy"]["mode"] == "native_delegate"
+            providers[-1].update(transport="http", session="unsupported",
+                                 approval="platform_native_not_checked" if native else "unsupported",
+                                 wechat_tool_approval="unsupported", policy_enforcement="not_checked",
+                                 dispatch="native_delegation_configured" if native else
+                                          "blocked_execution_policy_unverified")
     return {"ok": True, "mode": "backend_v1", "schema_version": 1,
             "default_backend": config["default_backend"], "backends": providers,
             "wechat_identity": "present", "wechat_token_validity": "not_checked",

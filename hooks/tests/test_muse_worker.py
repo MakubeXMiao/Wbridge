@@ -1,5 +1,6 @@
 """Synthetic, offline tests for the Muse adapter; never use live bot state."""
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import importlib.util
 import hashlib
 import io
@@ -490,6 +491,21 @@ class MuseWorkerTests(unittest.TestCase):
         self.assertEqual(limited["items"], items[:len(limited["items"])])
 
     def test_diagnostic_three_entries_preserve_counts_and_single_enqueue(self):
+        self.check_diagnostic_three_entries(self.diagnostic_item())
+
+    def test_incomplete_body_three_entries_preserve_final_sources_and_single_enqueue(self):
+        self.check_diagnostic_three_entries(self.diagnostic_item(reason="http_body_incomplete", size=32))
+
+    def test_incomplete_body_is_not_a_success_or_an_unknown_reason_escape(self):
+        item = self.diagnostic_item(reason="http_body_incomplete", size=32)
+        for invalid in (dict(item, outcome="success"), dict(item, reason="http_body_incomplete:PRIVATE")):
+            with self.subTest(item=invalid):
+                _, result = self.diagnostic_snapshot({"version": 1, "items": [invalid], "truncated": False})
+                self.assertEqual(result["messages"][0]["media_diagnostics"],
+                                 {"version": 1, "items": [], "truncated": True})
+                self.assertEqual(result["messages"][0]["text"], "available text")
+
+    def check_diagnostic_three_entries(self, first):
         def attach(mid, value):
             path = Path(self.base) / "inbox" / (mid + ".json")
             record = load_json(str(path))
@@ -497,7 +513,6 @@ class MuseWorkerTests(unittest.TestCase):
                           media_paths=["/synthetic/available.png"], media_diagnostics=value)
             atomic_write_json(str(path), record)
 
-        first = self.diagnostic_item()
         second = self.diagnostic_item(source="full_url", outcome="success", reason="ok", size=69)
         failed_attachment = self.diagnostic_item(index=1, source="unknown", size=None, reason="unknown")
         expected = {"version": 1, "items": [first, second, failed_attachment], "truncated": False}
@@ -661,6 +676,175 @@ class AttachmentAdapterTests(unittest.TestCase):
     def error_envelope(self, action, code, retryable=False):
         return {"schema_version": 1, "action": action, "ok": False, "result": None,
                 "error": {"code": code, "retryable": retryable, "refresh_required": code == "needs_refresh"}}
+
+    def install_reference_v2(self, position_limit=2, candidate_count=3):
+        self.install_wire()
+        self.caps["features"].append("references_v2")
+        positions = [dict(ordinal=index + 1, message_id="historical-mixed", item_index=index,
+                          attachment_id="v2-att-%d" % (index + 1), received_at=self.now - 3,
+                          event_seq=10, kind="file", status="ready", photo_state="not_photo")
+                     for index in range(candidate_count)]
+        positions[1].update(kind="image", photo_state="confirmed_photo")
+        positions[-1].update(status="pending", photo_state="unverified")
+        self.v2_messages = {"a": {
+            "schema_version": 2, "snapshot_id": "mixed-snapshot", "text_message_id": "a",
+            "group_id": "mixed-group", "login_epoch": "epoch-original", "cutoff_seq": 12,
+            "first_event_seq": 10, "last_member_seq": 11, "membership_digest": "b" * 64,
+            "created_at": self.now - 2, "expires_at": self.now + 100,
+            "position_limit": position_limit, "attachment_count": candidate_count + 1,
+            "candidate_position_count": candidate_count, "confirmed_photo_count": 1,
+            "overflow": True, "slots": positions[:position_limit], "latest_candidate": positions[-1],
+        }}
+        for name in ("begin", "refresh"):
+            original = getattr(self.state, name)
+            def wrapped(*args, original=original):
+                batch = original(*args)
+                for message in batch.get("messages", []):
+                    mid = message["message_id"]
+                    if mid in self.v2_messages:
+                        message["reference_context_v2"] = deepcopy(self.v2_messages[mid])
+                return batch
+            setattr(self.state, name, wrapped)
+
+    def test_reference_v2_reader_preserves_absent_and_explicit_null(self):
+        self.install_reference_v2()
+        self.v2_messages = {"b": None}
+        self.incoming("b", text="new writer without a photo reference")
+        _, batch = self.begin()
+        messages = {item["message_id"]: item for item in batch["messages"]}
+        self.assertIn("references_v2", batch["capabilities"]["features"])
+        self.assertNotIn("reference_context_v2", messages["a"])
+        self.assertIsNone(messages["b"]["reference_context_v2"])
+        for mid in ("a", "b"):
+            result = self.call(self.request(batch, "reference_v2", text_message_id=mid,
+                                            snapshot_id="mixed-snapshot"))
+            self.assertEqual(result["error"], "attachment_unavailable")
+        self.assertFalse(self.calls)
+        self.assertTrue(self.call(self.request(batch, "reference", text_message_id="a",
+                                               snapshot_id="snapshot-original"))["ok"])
+        del self.v2_messages["b"]
+        result = self.call({"action": "refresh", "handle": batch["handle"]})
+        self.assertEqual(result["error"], "invalid_state_result")
+
+    def test_reference_v2_context_requires_advertised_read_capability(self):
+        self.install_reference_v2()
+        self.caps["features"].remove("references_v2")
+        self.incoming("a")
+        event = self.state.plan()["payload"]
+        result = self.call({"action": "begin", "lease": event["lease"]})
+        self.assertEqual(result["error"], "attachment_unavailable")
+        self.assertFalse(self.calls)
+
+    def test_reference_v2_latest_outside_prefix_and_late_classification(self):
+        self.install_reference_v2(position_limit=16, candidate_count=17)
+        _, batch = self.begin()
+        context = batch["messages"][0]["reference_context_v2"]
+        self.assertEqual((context["attachment_count"], context["candidate_position_count"],
+                          context["confirmed_photo_count"]), (18, 17, 1))
+        self.assertEqual(len(context["slots"]), 16)
+        self.assertTrue(context["overflow"])
+        self.assertEqual(context["latest_candidate"]["attachment_id"], "v2-att-17")
+        self.assertEqual(context["latest_candidate"]["photo_state"], "unverified")
+        result = self.call(self.request(batch, "reference_v2", text_message_id="a",
+                                        snapshot_id="mixed-snapshot", ordinals=[17]))
+        self.assertEqual(result["error"], "invalid_request")
+        self.assertFalse(self.calls)
+
+        digest = self.session(batch["handle"])["batch_digest"]
+        source = self.v2_messages["a"]
+        source["slots"][1]["status"] = "missing"  # Photo recognition survives loss of access.
+        source["latest_candidate"].update(status="ready", photo_state="confirmed_photo")
+        source["confirmed_photo_count"] = 2
+        request = {"action": "refresh", "handle": batch["handle"]}
+        refreshed = self.call(request)
+        self.assertTrue(refreshed["ok"], refreshed)
+        self.assertEqual(refreshed["messages"][0]["reference_context_v2"], source)
+        self.assertEqual(self.session(batch["handle"])["batch_digest"], digest)
+        source["membership_digest"] = "c" * 64
+        self.assertEqual(self.call(request)["error"], "invalid_state_result")
+
+    def test_reference_v2_forwards_only_selected_frozen_slots(self):
+        self.install_reference_v2()
+        _, batch = self.begin()
+        args = {"text_message_id": "a", "snapshot_id": "mixed-snapshot", "ordinals": [1, 2]}
+        raw = {"reference_context_v2": self.v2_messages["a"],
+               "materials": [self.material(True, 2, "v2-att-2")],
+               "unavailable": [{"ordinal": 1, "attachment_id": "v2-att-1", "status": "ready",
+                                "photo_state": "not_photo"}], "complete": False}
+        self.response = {"schema_version": 1, "action": "reference_v2", "ok": True,
+                         "result": raw, "error": None}
+        for change in ({"text_message_id": "historical-mixed"}, {"snapshot_id": "different"},
+                       {"ordinals": [3]}, {"ordinals": [True]}, {"ordinals": [1, 1]},
+                       {"extra": "unspecified"}):
+            with self.subTest(change=change):
+                result = self.call(self.request(batch, "reference_v2", **dict(args, **change)))
+                self.assertFalse(result["ok"], result)
+        self.assertFalse(self.calls)
+        request = self.request(batch, "reference_v2", **args)
+        result = self.call(request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], raw)
+        self.assertEqual(self.calls, [(["a"], self.session(batch["handle"])["lease"], request["request"])])
+
+        for change in (
+            {"materials": [self.material(True, 1, "v2-att-1"), raw["materials"][0]],
+             "unavailable": [], "complete": True},  # Ready non-photo material is forbidden.
+            {"unavailable": [], "complete": True},  # Missing requested position.
+            {"unavailable": [dict(raw["unavailable"][0], photo_state="unverified")]},
+            {"unavailable": [dict(raw["unavailable"][0], status="missing")]},
+            {"reference_context_v2": dict(raw["reference_context_v2"], membership_digest="c" * 64)},
+        ):
+            with self.subTest(change=change):
+                self.response["result"] = dict(raw, **change)
+                rejected = self.call(request)
+                self.assertEqual(rejected["error"], "storage_invalid")
+                self.assertNotIn("result", rejected)
+
+        missing = deepcopy(raw)
+        missing["reference_context_v2"]["slots"][1]["status"] = "missing"
+        missing["materials"] = []
+        missing["unavailable"].append({"ordinal": 2, "attachment_id": "v2-att-2", "status": "missing",
+                                       "photo_state": "confirmed_photo"})
+        self.response["result"] = missing
+        result = self.call(request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], missing)
+
+    def test_reference_v2_without_ordinals_only_refreshes_metadata(self):
+        self.install_reference_v2()
+        _, batch = self.begin()
+        context = self.v2_messages["a"]
+        context["latest_candidate"].update(status="ready", photo_state="confirmed_photo")
+        context["confirmed_photo_count"] = 2
+        raw = {"reference_context_v2": context, "materials": [], "unavailable": [], "complete": True}
+        self.response = {"schema_version": 1, "action": "reference_v2", "ok": True,
+                         "result": raw, "error": None}
+        request = self.request(batch, "reference_v2", text_message_id="a", snapshot_id="mixed-snapshot")
+        result = self.call(request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], raw)
+        self.assertEqual(self.calls, [(["a"], self.session(batch["handle"])["lease"], request["request"])])
+
+        self.response["result"] = dict(raw, materials=[self.material(True, 2, "v2-att-2")])
+        rejected = self.call(request)
+        self.assertEqual(rejected["error"], "storage_invalid")
+        self.assertNotIn("result", rejected)
+
+    def test_reference_v2_rejects_malformed_counts_and_latest_shape(self):
+        self.install_reference_v2()
+        _, batch = self.begin()
+        raw = self.v2_messages["a"]
+        request = {"action": "refresh", "handle": batch["handle"]}
+        for change in (
+            {"attachment_count": True}, {"candidate_position_count": 5}, {"confirmed_photo_count": 0},
+            {"overflow": False}, {"private": "private field"},
+            {"slots": [dict(raw["slots"][0], private="private field"), raw["slots"][1]]},
+            {"latest_candidate": dict(raw["latest_candidate"], ordinal=4)},
+            {"latest_candidate": dict(raw["latest_candidate"], event_seq=13)},
+        ):
+            with self.subTest(change=change):
+                self.v2_messages["a"] = dict(raw, **change)
+                self.assertEqual(self.call(request)["error"], "invalid_state_result")
 
     def test_capabilities_reference_projection_and_no_historical_ownership(self):
         self.install_wire()

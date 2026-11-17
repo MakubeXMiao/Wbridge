@@ -4,12 +4,12 @@
 
 ## 1. 获取与安装
 
-1.1 从本公开仓库取得**完整固定提交**，包含 CC 模块和公共调度。下方文档记录固定 CLI 版本与当时验证边界，当前整体范围见[更新说明](../../PUBLIC-UPDATE-20261029.md)。
+1.1 由项目负责人授予新私有库 `MakubeXMiao/wbridge` 访问权。领取经过 00 集成 QA 的**完整 SHA**；本线分支只有 CC 模块，独立使用不等于已具备公共调度。后续只使用新仓库，不回旧库提交代码。
 
 ```bash
-git clone https://github.com/MakubeXMiao/wechat-bridge-muse.git
-cd wechat-bridge-muse
-git checkout --detach <本公开仓库的完整提交号>
+git clone git@github.com:MakubeXMiao/wbridge.git
+cd wbridge
+git checkout --detach <00提供的完整集成SHA>
 git rev-parse HEAD
 git status --short
 python3 -m venv .venv

@@ -151,7 +151,7 @@ class HttpDiagnosticsTests(unittest.TestCase):
         else:
             self.assertEqual(record["outcome"], "failed")
             self.assertIn(record["failure_reason"], (
-                "request_or_http_error", "http_body_read_failed", "ciphertext_too_large", "empty_body",
+                "request_or_http_error", "http_body_read_failed", "http_body_incomplete", "ciphertext_too_large", "empty_body",
                 "ciphertext_not_block_aligned", "decrypt_no_candidate", "decrypt_ambiguous", "plaintext_too_large"))
         self.assert_private()
 
@@ -316,7 +316,16 @@ class HttpDiagnosticsTests(unittest.TestCase):
     def test_content_length_valid_and_invalid_boundaries(self):
         for value, expected in (("0", 0), (str(len(PNG)), len(PNG)), (str(2 ** 63 - 1), 2 ** 63 - 1)):
             with self.subTest(value=value):
-                self.download([Response(PNG, headers={"Content-Length": value})])
+                responses = [Response(PNG, headers={"Content-Length": value})]
+                if expected == len(PNG):
+                    self.download(responses)
+                else:
+                    # Strict image integrity now rejects mismatched declared
+                    # lengths; a short body gets one bounded fresh GET.
+                    if expected > len(PNG):
+                        responses.append(Response(PNG, headers={"Content-Length": value}))
+                    with self.assertRaisesRegex(ValueError, "media_receive_all_sources_failed"):
+                        self.download(responses)
                 record = self.records()[-1]
                 self.assert_schema(record)
                 self.assertEqual(record["content_length_state"], "valid")

@@ -94,7 +94,7 @@ def message_receipt_lock(store):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def quarantine_record(store, payload, reason):
+def quarantine_record(store, payload, reason, *, before_first_record=None):
     """Durably preserve rejected input before acknowledging its poll batch.
 
     The raw input may contain messages/tokens and is only written to a private
@@ -107,6 +107,8 @@ def quarantine_record(store, payload, reason):
     digest = hashlib.sha256((reason + "\n" + raw).encode("utf-8")).hexdigest()
     path = os.path.join(store.quarantine_dir, digest + ".json")
     if not os.path.exists(path):
+        if before_first_record is not None:
+            before_first_record()
         atomic_write_json(path, {"reason": reason, "payload": payload,
                                  "quarantined_at": time.time()})
     atomic_write_text(store.quarantine_status_path, "%s %s %s\n" % (

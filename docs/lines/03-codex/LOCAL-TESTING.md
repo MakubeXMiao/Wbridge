@@ -4,7 +4,7 @@
 
 ## 版本及目录
 
-从本公开仓库取完整固定提交；安装须包含适配器及公共 v1 CLI/调度。先记录源码 SHA/dirty、解释器、实际 `wechat_bridge.__file__`、Codex 绝对路径/`--version`、启动时间；不要把当前磁盘 HEAD 倒填到旧进程。
+只从新私有库 `MakubeXMiao/wbridge` 取固定集成 SHA；03 单支包含适配器，公共 v1 CLI/调度需由 00 集成。先记录源码 SHA/dirty、解释器、实际 `wechat_bridge.__file__`、Codex 绝对路径/`--version`、启动时间；不要把当前磁盘 HEAD 倒填到旧进程。
 
 另建独立运行根（例 `/absolute/wbridge-codex-test`）及独立工作目录（例 `/absolute/wbridge-codex-workspace`），均放在 Git 仓库外，权限 0700。首次登录使用全新空运行根，不能在其中预放配置、模板或其他数据。所有测试命令显式设置 `WECHAT_BRIDGE_DIR` 为新运行根。该根下的 `state/`、`media/`、backend DB 与会话不复用 Muse 或旧 Codex relay。`CODEX_HOME` 维持本机已登录配置，不复制 auth 文件，也不另建 key。
 

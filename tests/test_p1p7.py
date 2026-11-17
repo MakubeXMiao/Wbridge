@@ -106,6 +106,8 @@ def write_job(store, name, **kw):
     job = {"to_user_id": "user1", "text": "hello", "context_token": "tok1",
            "message_id": 1, "enqueued_at": time.time()}
     job.update(kw)
+    if job.get("attempts") and job.get("delivery_state") == serve._SEND_READY:
+        job["embedded_send_authority"] = serve._embedded_send_authority(job["to_user_id"], "BOTTOKEN")
     atomic_write_json(os.path.join(store.pending_dir, name), job)
     return job
 
@@ -154,13 +156,15 @@ def t_resp_ok():
 def t_poison_deadletter():
     net = FakeNet()
     store = fresh_store(net)
-    write_job(store, "bad.json", text="bad", attempts=4,
+    write_job(store, "bad.json", text="bad", attempts=4, delivery_state=serve._SEND_READY,
               enqueued_at=time.time() - 10)
-    write_job(store, "good.json", text="good", attempts=1,
+    write_job(store, "good.json", text="good", attempts=1, delivery_state=serve._SEND_READY,
               enqueued_at=time.time() - 9)
     net.send_script = [{"ret": -2, "errmsg": "prepare failed"}]
     flush(store)
-    check("P1 毒任务第 5 次失败进死信", ls(store.failed_dir) == ["bad.json"])
+    failed = load_json(os.path.join(store.failed_dir, "bad.json")) or {}
+    check("P1 毒任务第 5 次失败进死信", ls(store.failed_dir) == ["bad.json"]
+          and failed.get("attempts") == 5 and failed.get("delivery_outcome") == "unknown")
     check("P1 好任务同轮照常送达", ls(store.sent_dir) == ["good.json"])
     check("P1 发送调用次数", net.send_count() == 2, net.send_count())
 
@@ -186,6 +190,7 @@ def t_token_cap():
     store = fresh_store(net)
     for i in range(9):
         write_job(store, "j%d.json" % i, text="m%d" % i, attempts=1,
+                  delivery_state=serve._SEND_READY,
                   enqueued_at=time.time() - 100 + i)
     flush(store)
     check("P3 单 token 最多发 8 条", net.send_count() == 8, net.send_count())
@@ -211,10 +216,13 @@ def t_caption_once():
     store = fresh_store(net)
     mp = make_media_file(store)
     write_job(store, "m.json", text="captext", media_path=mp)
-    net.send_script = [{"message_id": 1},          # 配文
-                       {"ret": -2},                # 媒体第一次失败
-                       {"message_id": 2}]          # 媒体重试成功
+    upload_resp = net.upload_resp
+    net.upload_resp = {"ret": -2}  # 取址失败，媒体尚未发起最终请求。
+    net.send_script = [{"message_id": 1}, {"message_id": 2}]
     flush(store)
+    check("P3 取址失败后仅媒体留队", net.send_count() == 1
+          and ls(store.pending_dir) == ["m.json"])
+    net.upload_resp = upload_resp
     force_retry(store, "m.json")
     flush(store)
     check("P3 配文恰好发一次", net.send_texts().count("captext") == 1,
@@ -226,24 +234,28 @@ def t_caption_once():
 def t_probe_ok():
     net = FakeNet()
     store = fresh_store(net)
-    write_job(store, "p.json", attempts=1)
+    write_job(store, "p.json")
     net.send_script = [{"ret": -14}]
     net.probe_resp = {"ret": 0}
     r = flush(store)
     check("P4 探活正常不当失效", r is True
           and not os.path.exists(store.needs_relogin_path)
-          and ls(store.pending_dir) == ["p.json"])
+          and not ls(store.pending_dir)
+          and (load_json(os.path.join(store.failed_dir, "p.json")) or {}).get("delivery_outcome")
+              == "unknown")
 
 
 def t_probe_bad():
     net = FakeNet()
     store = fresh_store(net)
-    write_job(store, "p.json", attempts=1)
+    write_job(store, "p.json")
     net.send_script = [{"ret": -14}]
     net.probe_resp = {"ret": -14}
     r = flush(store)
     check("P4 探活也 -14 才判失效", r is False
-          and os.path.exists(store.needs_relogin_path))
+          and os.path.exists(store.needs_relogin_path) and not ls(store.pending_dir)
+          and (load_json(os.path.join(store.failed_dir, "p.json")) or {}).get("delivery_outcome")
+              == "unknown")
 
 
 # ---------- P3：长文本分片续发 ----------
@@ -251,15 +263,15 @@ def t_chunk_resume():
     net = FakeNet()
     fresh_store(net)
     text = "a" * 4500
-    net.send_script = [{"message_id": 1}, {"ret": -2, "errmsg": "x"}]
     resp = ilink.send_message("https://api.invalid", "T", "user1", text,
-                              "tok", pace=0)
-    check("P3 分片失败报告进度 1/3", resp.get("_chunks_done") == 1
+                              "tok", pace=0, max_chunks=1)
+    check("P3 达到发送上限后报告进度 1/3", resp.get("_deferred") is True
+          and resp.get("_chunks_done") == 1
           and resp.get("_chunks_total") == 3, resp)
     resp2 = ilink.send_message("https://api.invalid", "T", "user1", text,
                                "tok", start_chunk=resp["_chunks_done"], pace=0)
     check("P3 续发只发剩余片", resp2.get("_chunks_done") == 3
-          and net.send_count() == 4, net.send_count())
+          and net.send_count() == 3, net.send_count())
 
 
 # ---------- P5：上传 full_url 404 回退 param ----------

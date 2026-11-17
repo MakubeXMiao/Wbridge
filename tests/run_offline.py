@@ -12,8 +12,12 @@ SUITES = [
     'test_crypto.py', 'test_p1p7.py', 'test_merge.py', 'test_speed.py',
     'test_audit2fix.py', 'test_audit12.py', 'test_receiver_hardening.py',
     'test_media_login_hardening.py', 'test_media_http_diagnostics.py', 'test_delivery_hardening.py',
+    'test_media_integrity.py', 'test_media_read_progress.py',
     'test_worker_state.py', 'test_burst_ownership.py', 'test_latency_trace.py',
     'test_backend_registry.py', 'test_backend_dispatcher.py',
+    'test_pepe_registry.py', 'test_pepe_core_dispatcher.py',
+    'test_pepe_input_provenance.py', 'test_remote_tasks.py',
+    'test_pepe_backend.py',
     'test_media_validation.py', 'test_failure_capture.py',
     'test_media_retention.py', 'test_inbox_media_diagnostics.py',
     'test_runtime_logs.py', 'test_supervision_events.py',
@@ -29,6 +33,13 @@ SUITES = [
     'test_second_review_managed_paths.py',
     'test_second_review_admission.py',
     'test_second_review_labels.py',
+    'test_image_first_transport.py', 'test_image_first_chain.py', 'test_image_first_send.py',
+    'test_attachment_references_v2.py', 'test_round1_reference_runtime.py',
+    'test_round1_rollback_guard.py',
+    'test_cdn_transport.py', 'test_cdn_process.py', 'test_cdn_upload_integration.py',
+    'test_cdn_trial.py', 'test_cdn_trial_budget.py',
+    'test_recent_context_sequences.py', 'test_recent_context.py',
+    'test_cloud_context.py', 'test_context_runtime.py',
 ]
 GUARD = '''import os, runpy, socket, sys, tempfile
 from pathlib import Path

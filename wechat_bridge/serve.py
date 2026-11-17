@@ -12,9 +12,11 @@ iLink deduplication and Muse platform scheduling still require owner acceptance.
 """
 
 import fcntl
+import hashlib
 import json
 import math
 import os
+import re
 import threading
 import time
 
@@ -22,8 +24,13 @@ from .ilink import (
     ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE,
     auth_headers, http_json, is_token_invalid, resp_ok, send_message, split_text,
 )
-from .media import download_media, log_image_item_fields, media_type_from_path, send_media_message
+from .media import (
+    download_media, log_image_item_fields, media_type_from_path, send_media_message,
+    supervised_cdn_options,
+)
+from .cdn_process import CDNReapError
 from .media_diagnostics import sanitize_media_diagnostics
+from .progress import OperationAborted
 from .store import (
     Store, atomic_write_json, atomic_write_text, load_json, log,
     mark_needs_relogin, message_receipt_lock, quarantine_record, safe_message_id,
@@ -126,6 +133,20 @@ def _write_inbox_record(store, msg, from_id, text, media_paths=None,
         "create_time_ms": msg.get("create_time_ms"),
         "received_at": time.time() if received_at is None else received_at,
     }
+    if hasattr(store, "managed_inbox_dir"):
+        # Keep source types for managed providers that only accept plain text.
+        # A voice transcript or an unsupported mixed item must not gain text
+        # privileges merely because extract_text() flattened its representation.
+        items = msg.get("item_list")
+        group = msg.get("group_id")
+        record["input_provenance"] = {
+            "schema_version": 1,
+            "single_chat": (type(msg.get("message_type")) is int
+                            and msg["message_type"] == 1
+                            and (group is None or type(group) is str and group == "")),
+            "item_types": [item.get("type") if isinstance(item, dict) else None
+                           for item in items] if isinstance(items, list) else None,
+        }
     if login_epoch is not None:
         record["login_epoch"] = login_epoch
     if attachment_event is not None:
@@ -133,6 +154,8 @@ def _write_inbox_record(store, msg, from_id, text, media_paths=None,
             ("attachment_id", "item_index", "kind", "status")}
             for ref in attachment_event["attachment_refs"]]
         record["reference_context"] = attachment_event["reference_context"]
+        if "reference_context_v2" in attachment_event:
+            record["reference_context_v2"] = attachment_event["reference_context_v2"]
     if media_paths:
         record["media_paths"] = media_paths
     if media_failed:
@@ -158,9 +181,14 @@ def _write_inbox_record(store, msg, from_id, text, media_paths=None,
     return True
 
 
-def _quarantine_incoming(store, payload, reason):
+def _quarantine_incoming(store, payload, reason, *, reference_gap=False):
     """Only a durable quarantine counts as accepted; failed writes retain cursor."""
     try:
+        if reference_gap:
+            from .attachment_runtime import break_reference_group, reference_continuity_active
+            if reference_continuity_active(store):
+                return quarantine_record(store, payload, reason,
+                                         before_first_record=lambda: break_reference_group(store))
         return quarantine_record(store, payload, reason)
     except Exception as error:
         log("接收隔离写入失败，本批游标保留（%s）" % type(error).__name__)
@@ -209,6 +237,16 @@ def _incoming_shape_error(msg):
     return None
 
 
+
+def _image_stage(stage, outcome, message_id, item_index):
+    """Finite local publication phases; never paths, names or response text."""
+    try:
+        log("image_pipeline " + json.dumps({"event": "image_pipeline", "schema_version": 1,
+            "stage": stage, "outcome": outcome, "message_id": message_id,
+            "item_index": item_index}, separators=(",", ":")))
+    except Exception:
+        pass
+
 def handle_incoming(store, msg, owner_id):
     """Accept a filtered, persisted, or visibly quarantined input; never drop raw invalid data."""
     if not isinstance(owner_id, str) or not owner_id.strip():
@@ -218,9 +256,12 @@ def handle_incoming(store, msg, owner_id):
     if isinstance(msg, dict) and isinstance(msg.get("from_user_id"), str) \
             and msg.get("from_user_id") and msg["from_user_id"] != owner_id:
         return True
+    from . import attachment_runtime as attachments
+    reference_v2 = attachments.reference_v2_enabled()
+    continuity_active = attachments.reference_continuity_active(store)
     reason = _incoming_shape_error(msg)
     if reason:
-        return _quarantine_incoming(store, msg, reason)
+        return _quarantine_incoming(store, msg, reason, reference_gap=True)
     if msg.get("group_id") or msg.get("message_type") != 1:
         return True
     from_id = msg["from_user_id"]
@@ -241,7 +282,6 @@ def handle_incoming(store, msg, owner_id):
              ITEM_VIDEO: ("video", "mp4", "video_item"),
              ITEM_FILE: ("file", "bin", "file_item"),
              ITEM_VOICE: ("voice", "silk", "voice_item")}
-    from . import attachment_runtime as attachments
     received_at = time.time()
     scope, attachment_event, references = None, None, {}
     catalog_unavailable = False
@@ -271,6 +311,20 @@ def handle_incoming(store, msg, owner_id):
             except Exception:
                 scope = None
             attachment_event = {"attachment_refs": [], "reference_context": None}
+            if continuity_active:
+                try:
+                    attachments.break_reference_group(store)
+                except (OSError, ValueError):
+                    log("附件引用分组边界保存失败，本批游标保留")
+                    return False
+            if reference_v2:
+                attachment_event["reference_context_v2"] = None
+    elif continuity_active:
+        try:
+            attachments.break_reference_group(store)
+        except (OSError, ValueError):
+            log("附件引用分组边界保存失败，本批游标保留")
+            return False
     for index, item in enumerate(msg.get("item_list") or []):
         kind_info = kinds.get(item.get("type"))
         if not kind_info:
@@ -309,10 +363,14 @@ def handle_incoming(store, msg, owner_id):
                 if current_scope_value != scope:
                     raise OperationAborted("epoch_mismatch")
             options.update(preserve_original=True, metadata=metadata, progress=receive_progress)
+            if kind == "file" and "reference_context_v2" in attachment_event:
+                options["classify_plain_text"] = True
         if getattr(store, "failure_capture", None) is not None:
             options["failure_capture"] = store.failure_capture
+        image_stage = "download"
         try:
             if reference is not None and reference["status"] == "ready":
+                image_stage = "index_acquire"
                 pass  # Replay repairs only inbox/receipt; never re-download.
             elif item["type"] == ITEM_IMAGE:
                 log_image_item_fields(sub)
@@ -322,20 +380,30 @@ def handle_incoming(store, msg, owner_id):
             else:
                 download_media(sub.get("media") or {}, _media_key(sub), dest, **options)
             downloaded = True
+            if item["type"] == ITEM_IMAGE and image_stage == "download":
+                _image_stage(image_stage, "success", message_id, index)
             if reference is not None:
                 files = attachments.catalog(store)
                 if reference["status"] != "ready":
                     tags = []
                     if text.strip() and len(text.strip()) <= 128:
                         tags.append({"value": text.strip(), "source": "batch_text", "message_id": message_id})
+                    image_stage = "catalog_publish"
                     files.publish(scope, reference["attachment_id"], dest,
                         tags=tags, **metadata)
+                    if item["type"] == ITEM_IMAGE:
+                        _image_stage(image_stage, "success", message_id, index)
+                image_stage = "index_acquire"
                 material = files.acquire(scope, reference["attachment_id"], "inbox:" + message_id)
                 dest = material["path"]
                 reference["status"] = "ready"
+                if item["type"] == ITEM_IMAGE:
+                    _image_stage(image_stage, "success", message_id, index)
             media_paths.append(dest)
             log("已接收附件 [%s] item=%d kind=%s" % (message_id, index, kind))
         except Exception as error:
+            if item["type"] == ITEM_IMAGE:
+                _image_stage(image_stage, "failed", message_id, index)
             if reference is not None:
                 if downloaded:
                     log("附件发布待恢复，游标保留（%s）" % type(error).__name__)
@@ -473,20 +541,74 @@ def _job_enqueued_at(path, job):
         return time.time()
 
 
-def _fail_job(store, sending_path, name, job, reason):
+_SEND_READY = "send_ready_v1"
+_FINAL_INFLIGHT = "final_inflight_v1"
+_API_ACCEPTED = "api_accepted_v1"
+_EMBEDDED_SEND_AUTHORITY = "embedded_send_authority"
+
+
+def _send_authority(job):
+    return job.get("login_epoch"), job.get(_EMBEDDED_SEND_AUTHORITY)
+
+
+def _conflicting_bound_authority(left, right):
+    if not isinstance(right, dict):
+        return False
+    left_scope, right_scope = _send_authority(left), _send_authority(right)
+    return any(left_scope) and any(right_scope) and left_scope != right_scope
+
+
+def _embedded_send_authority(recipient, token):
+    # Standalone callers may send without a login session. Persist a verifier
+    # for their authority so legacy unbound progress cannot pass as a retry.
+    authority = json.dumps([recipient, token], separators=(",", ":"))
+    return hashlib.sha256(authority.encode("ascii")).hexdigest()
+
+
+def _delivery_uncertain(job):
+    state = job.get("delivery_state")
+    if job.get("delivery_outcome") == "unknown":
+        return True
+    if state == _API_ACCEPTED:
+        return not _accepted_envelope(job)
+    if state == _SEND_READY:
+        return bool((job.get("attempts") or job.get("chunks_done"))
+                    and not any(_send_authority(job)))
+    if state not in (None, "prepared"):
+        return True
+    # Old attempts recorded an entire send flow, without a final POST boundary.
+    return bool(job.get("attempts") or job.get("chunks_done"))
+
+
+def _accepted_envelope(job):
+    return (job.get("delivery_state") == _API_ACCEPTED and
+            (bool(job.get("media_path")) or
+             job.get("chunks_done") == len(split_text(job.get("text") or ""))))
+
+
+def _fail_job(store, sending_path, name, job, reason, outcome=None):
     """把已认领的任务移入 failed/ 并记录原因。"""
-    job["failed_reason"] = reason
-    job["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    atomic_write_json(os.path.join(store.failed_dir, name), job)
+    failed_path = os.path.join(store.failed_dir, name)
+    first_failure = not os.path.lexists(failed_path)
+    if first_failure:
+        # For split text the outcome describes the unresolved suffix.
+        job["delivery_outcome"] = outcome or ("unknown" if _delivery_uncertain(job)
+                                              else "proven_unsent")
+        job["failed_reason"] = reason
+        job["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        atomic_write_json(failed_path, job)
     try:
         os.unlink(sending_path)
     except OSError:
         pass
-    log("任务进死信 failed/: %s" % reason, job=name)
+    if first_failure:
+        log("任务进死信 failed/: %s" % reason, job=name)
 
 
 def _return_to_pending(store, sending_path, pending_path, job):
     """把已认领的任务连同退避状态写回 pending/。"""
+    if job.get("delivery_state") != _SEND_READY or _delivery_uncertain(job):
+        raise ValueError("send outcome requires reconciliation before requeue")
     atomic_write_json(pending_path, job)
     try:
         os.unlink(sending_path)
@@ -500,6 +622,12 @@ def _job_schema_error(job):
     for field in ("text", "media_path", "to_user_id", "context_token", "client_key"):
         if field in job and not isinstance(job[field], str):
             return "%s must be text" % field
+    epoch, embedded = _send_authority(job)
+    if "login_epoch" in job and (not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{32}", epoch)):
+        return "invalid login epoch"
+    if _EMBEDDED_SEND_AUTHORITY in job and (
+            not isinstance(embedded, str) or not re.fullmatch(r"[0-9a-f]{64}", embedded) or epoch):
+        return "invalid embedded send authority"
     for field in ("attempts", "chunks_done"):
         value = job.get(field, 0)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -646,7 +774,7 @@ def _split_caption(store, name, job):
     }
     # Preserve observation times through caption splitting. Queue identity,
     # coverage and delivery decisions remain unchanged.
-    for field in ("received_at", "worker_started_at", "login_epoch"):
+    for field in ("received_at", "worker_started_at", "login_epoch", _EMBEDDED_SEND_AUTHORITY):
         if field in job:
             cap_job[field] = job[field]
     return job, cap_name, cap_job
@@ -658,7 +786,7 @@ def _is_mergeable_text(name, job):
         return False
     if job.get("backend_v1") or job.get("media_path") or job.get("client_key") or job.get("merged_from"):
         return False
-    if job.get("delivery_state") in ("inflight", "recovered", "prepared"):
+    if job.get("delivery_state") is not None:
         return False
     if int(job.get("attempts") or 0) != 0:
         return False
@@ -718,32 +846,138 @@ def _trace_delivery(stage, name, job, started_at=None, chunks_done=None,
 
 
 def _deliver_claimed(store, baseurl, token, counts, name, job,
-                     sending_path, pending_path, enqueued_at, attempts):
-    """任务已认领（文件在 sending/）后的发送与结果处置。
-
-    单发与合并组降级逐条发送共用。返回 False 仅当 token 确认失效
-    （sendmessage -14 且探活也 -14，已写 NEEDS_RELOGIN、任务留队）。
-    """
+                     sending_path, pending_path, enqueued_at, attempts, stop_event=None):
+    """Send the remaining suffix while retaining an exact final POST boundary."""
     if _ordinary_original_blocked(store, name, job):
         return True
+    if _delivery_uncertain(job):
+        _fail_job(store, sending_path, name, job,
+                  "unverified previous send; reconciliation required", "unknown")
+        return True
+    if _accepted_envelope(job):
+        _mark_sent(store, sending_path, name)
+        return True
+
+    from .attachment_runtime import (
+        AttachmentCallError, BudgetUnavailable, current_scope, send_budget, stage_progress,
+    )
+
     to_user_id = job.get("to_user_id") or ""
     tok_key = job.get("context_token") or ""
     attempt_no = attempts + 1
-    # 状态机（任务书设计）：claimed → inflight → 分发处置。
-    # 一进入发送流程就打上 inflight 并落盘，配合 run() 启动时对
-    # sending/ 的全量回收，serve 中途被杀也能被识别、退回重发。
-    job["delivery_state"] = "inflight"
+    deadline = enqueued_at + MAX_JOB_AGE
+    job.update(enqueued_at=enqueued_at, delivery_state=_SEND_READY)
     job.setdefault("client_key", name)
-    job["attempts"] = attempt_no
-    from .attachment_runtime import send_budget, BudgetUnavailable, stage_progress
     budget = None
+    started_at = None
+    performed = False
+    phase_write_failed = False
+    session_required = (getattr(store, "_send_session_required", False) or
+                        os.path.lexists(store.session_path))
+
+    def check_scope(*, require_bound=False):
+        nonlocal session_required
+        try:
+            session = load_json(store.session_path)
+        except (OSError, ValueError):
+            raise OperationAborted("epoch_mismatch") from None
+        session_required = (session_required or isinstance(session, dict) or
+                            os.path.lexists(store.session_path))
+        expected_epoch, expected_embedded = _send_authority(job)
+        try:
+            if session_required:
+                if (expected_embedded or not isinstance(session, dict)
+                        or session.get("bot_token") != token
+                        or session.get("ilink_user_id") != to_user_id):
+                    raise OperationAborted("epoch_mismatch")
+                epoch = session.get("login_epoch")
+                if epoch is not None:
+                    if ((expected_epoch is not None and expected_epoch != epoch)
+                            or current_scope(store, to_user_id)["login_epoch"] != epoch):
+                        raise OperationAborted("epoch_mismatch")
+                    job["login_epoch"] = epoch
+                elif expected_epoch is not None or require_bound:
+                    # The attachment runtime may migrate an existing session
+                    # during preparation. It must do so before any send.
+                    raise OperationAborted("epoch_mismatch")
+            else:
+                embedded = _embedded_send_authority(to_user_id, token)
+                if expected_epoch is not None or (expected_embedded and expected_embedded != embedded):
+                    raise OperationAborted("epoch_mismatch")
+                job[_EMBEDDED_SEND_AUTHORITY] = embedded
+            if budget is not None:
+                budget.check()
+        except AttachmentCallError:
+            raise OperationAborted("epoch_mismatch") from None
+
+    def check(*, require_bound=False):
+        if (stop_event is not None and stop_event.is_set()) or not os.path.exists(sending_path):
+            raise OperationAborted("cancelled")
+        if os.path.exists(store.needs_relogin_path):
+            raise OperationAborted("epoch_mismatch")
+        if time.time() >= deadline:
+            raise OperationAborted("expired")
+        check_scope(require_bound=require_bound)
+
+    def write_phase(phase, **fields):
+        nonlocal phase_write_failed
+        updated = dict(job, delivery_state=phase, **fields)
+        try:
+            atomic_write_json(sending_path, updated)
+        except OSError:
+            # A rename may have published the new phase before fsync failed.
+            # Recovery must inspect the file before choosing an outcome.
+            phase_write_failed = True
+            raise
+        job.update(updated)
+
+    def before(index, total):
+        nonlocal performed, started_at
+        check(require_bound=True)
+        performed = budget.before(index, total) if budget is not None else True
+        if performed:
+            check()
+            write_phase(_FINAL_INFLIGHT)
+            if started_at is None:
+                started_at = time.time()
+                _trace_delivery("send_started", name, job, started_at=started_at)
+            check()
+        return performed
+
+    def result(index, total, response):
+        check_scope()
+        if budget is not None:
+            budget.result(index, total, response)
+        if not resp_ok(response):
+            return
+        media = bool(job.get("media_path"))
+        fields = {} if media else {"chunks_done": index + 1}
+        write_phase(_API_ACCEPTED if index + 1 == total else _SEND_READY, **fields)
+        if performed:
+            counts[tok_key] = counts.get(tok_key, 0) + 1
+            _trace_delivery("api_accepted", name, job, started_at=started_at,
+                            chunks_done=None if media else index + 1,
+                            chunks_total=None if media else total)
+            _touch_flusher_heartbeat(store)
+
+    def requeue(next_at, *, deferred=False):
+        if max(time.time(), next_at) >= deadline:
+            _fail_job(store, sending_path, name, job, "send deadline expired")
+            return
+        try:
+            check_scope(require_bound=True)
+        except OperationAborted as error:
+            _fail_job(store, sending_path, name, job, "send authority lost: " + error.code)
+            return
+        job["next_attempt_at"] = next_at
+        if deferred:
+            job.update(budget_deferred=True, attempts=attempts)
+        _return_to_pending(store, sending_path, pending_path, job)
+
     try:
+        check()
+        job["attempts"] = attempt_no
         atomic_write_json(sending_path, job)
-        if job.get("login_epoch") is not None:
-            from .attachment_runtime import current_scope
-            if job["login_epoch"] != current_scope(store, to_user_id)["login_epoch"]:
-                from .progress import OperationAborted
-                raise OperationAborted("epoch_mismatch")
         media_path = job.get("media_path") or ""
         if media_path:
             if not job.get("download_caution_checked"):
@@ -752,190 +986,123 @@ def _deliver_claimed(store, baseurl, token, counts, name, job,
                     {"original_name": os.path.basename(media_path), "declared_type": None}])
                 job["download_caution_checked"] = True
                 atomic_write_json(sending_path, job)
-            # 审查第 4 项：配文必须先于媒体送达。本轮新拆出的配文先在
-            # 同一次流程里认领发出；配文若只是排了重试（还没送达），
-            # 媒体顺延到配文的下一次重试之后，绝不抢跑。
             job, cap_name, cap_job = _split_caption(store, name, job)
             if cap_job is not None:
                 cap_sending = os.path.join(store.sending_dir, cap_name)
                 cap_pending = os.path.join(store.pending_dir, cap_name)
-                cap_job["delivery_state"] = "inflight"
+                cap_job["delivery_state"] = _SEND_READY
                 atomic_write_json(cap_sending, cap_job)
-                log("配文已拆为独立任务 %s（先于媒体发送）" % cap_name,
-                    job=name)
+                atomic_write_json(sending_path, job)
                 if not _deliver_claimed(store, baseurl, token, counts,
                                         cap_name, cap_job, cap_sending,
-                                        cap_pending, enqueued_at, 0):
-                    # token 确认失效：媒体也别发了，原样回 pending
-                    job["next_attempt_at"] = 0
-                    _return_to_pending(store, sending_path, pending_path, job)
+                                        cap_pending, enqueued_at, 0, stop_event):
+                    requeue(0)
                     return False
             if cap_name:
-                # 统一按配文的实际落点决定媒体的命运（本轮刚发的、以前
-                # 拆好还在排队的都一样）：
-                # - 配文已死信 → 媒体失去说明，跟着进死信等人工处置，
-                #   不发无头无尾的图，配文也不会被无限单独重发；
-                # - 配文还在 pending/sending（未送达）→ 媒体顺延到它
-                #   送达之后，绝不抢跑（审查第 4 项的重试路径）；
-                # - 配文已在 sent（或从未拆出）→ 正常发媒体。
                 cap_pending = os.path.join(store.pending_dir, cap_name)
-                if os.path.exists(os.path.join(store.failed_dir, cap_name)):
-                    _fail_job(store, sending_path, name, job,
-                              "配文 %s 已进死信，媒体随之进死信待人工处置"
-                              % cap_name)
+                if os.path.lexists(os.path.join(store.failed_dir, cap_name)):
+                    _fail_job(store, sending_path, name, job, "media caption requires review")
                     return True
-                if os.path.exists(cap_pending) or os.path.exists(
-                        os.path.join(store.sending_dir, cap_name)):
+                if (os.path.lexists(cap_pending) or
+                        os.path.lexists(os.path.join(store.sending_dir, cap_name))):
                     cap_state = load_json(cap_pending) or {}
-                    job["next_attempt_at"] = float(
-                        cap_state.get("next_attempt_at") or
-                        (time.time() + BACKOFFS[0]))
-                    _return_to_pending(store, sending_path, pending_path, job)
-                    log("配文未送达，媒体顺延", job=name)
+                    requeue(float(cap_state.get("next_attempt_at") or
+                                  (time.time() + BACKOFFS[0])))
                     return True
             if not os.path.exists(media_path):
-                _fail_job(store, sending_path, name, job,
-                          "媒体文件不存在: %s" % media_path)
+                _fail_job(store, sending_path, name, job, "media file missing")
                 return True
             if counts.get(tok_key, 0) >= TOKEN_SEND_CAP:
-                job["budget_deferred"] = True
-                job["attempts"] = attempts
-                job["next_attempt_at"] = 0
-                _return_to_pending(store, sending_path, pending_path, job)
+                requeue(0, deferred=True)
                 return True
-            send_started_at = time.time()
             if _ordinary_original_blocked(store, name, job):
                 return True
-            _trace_delivery("send_started", name, job, started_at=send_started_at)
+            check()
             budget = send_budget(store, to_user_id, token, tok_key, job["client_key"])
-            options = {"client_key": job["client_key"],
-                       "heartbeat": lambda: _touch_flusher_heartbeat(store)}
-            if budget is not None:
-                already_accepted = budget.prepare() == "accepted"
-                def heartbeat():
-                    budget.check()
-                    _touch_flusher_heartbeat(store)
-                options.update(before_send=budget.before, on_result=budget.result,
-                               progress=stage_progress(store, budget.check), heartbeat=heartbeat)
+            check_scope(require_bound=True)
+            if budget is not None and budget.prepare() == "accepted":
+                result(0, 1, {"ret": 0})
+                resp = {"ret": 0}
             else:
-                already_accepted = False
-            resp = ({"ret": 0, "_locally_accepted": True} if already_accepted else
-                send_media_message(baseurl, token, to_user_id, tok_key, media_path,
-                                   media_type_from_path(media_path), **options))
-            sent_units = 1
-            if resp_ok(resp):
-                _trace_delivery("api_accepted", name, job, started_at=send_started_at)
-                counts[tok_key] = counts.get(tok_key, 0) + 1
+                progress = stage_progress(store, check)
+
+                def media_progress(event):
+                    if event["stage"] != "send_after":
+                        progress(event)
+
+                def heartbeat():
+                    check()
+                    _touch_flusher_heartbeat(store)
+
+                resp = send_media_message(
+                    baseurl, token, to_user_id, tok_key, media_path,
+                    media_type_from_path(media_path), client_key=job["client_key"],
+                    before_send=before, on_result=result, progress=media_progress,
+                    heartbeat=heartbeat, **supervised_cdn_options(
+                        store, job["client_key"], lambda: check(require_bound=True), deadline))
         else:
             start_chunk = int(job.get("chunks_done") or 0)
+            if start_chunk == len(split_text(job.get("text") or "")):
+                write_phase(_API_ACCEPTED)
+                resp = {"ret": 0}
+            else:
+                budget = send_budget(store, to_user_id, token, tok_key, job["client_key"])
+                resp = send_message(
+                    baseurl, token, to_user_id, job.get("text") or "", tok_key,
+                    start_chunk=start_chunk, client_key=job["client_key"],
+                    pace=PACE_SECONDS, before_send=before, on_result=result,
+                    max_chunks=max(0, TOKEN_SEND_CAP - counts.get(tok_key, 0)))
 
-            def _persist_chunk_progress(done, total,
-                                        _job=job, _path=sending_path):
-                _trace_delivery("api_accepted", name, _job,
-                                started_at=send_started_at,
-                                chunks_done=done, chunks_total=total)
-                # 每片送达立即落盘：进程被杀也不丢已达片数（审查第 3 项）
-                previous = int(_job.get("chunks_done") or 0)
-                _job["chunks_done"] = done
-                counts[tok_key] = counts.get(tok_key, 0) + max(0, done - previous)
-                atomic_write_json(_path, _job)
-                # 顺手刷新心跳：长文本逐片发时 flusher 显然活着（P1-1）
-                _touch_flusher_heartbeat(store)
-
-            send_started_at = time.time()
-            if start_chunk < len(split_text(job.get("text") or "")):
-                _trace_delivery("send_started", name, job, started_at=send_started_at)
-            budget = send_budget(store, to_user_id, token, tok_key, job["client_key"])
-            options = {"before_send": budget.before, "on_result": budget.result} if budget else {}
-            resp = send_message(
-                baseurl, token, to_user_id, job.get("text") or "",
-                job.get("context_token") or "",
-                start_chunk=start_chunk,
-                on_chunk=_persist_chunk_progress,
-                client_key=job["client_key"], pace=PACE_SECONDS,
-                max_chunks=max(0, TOKEN_SEND_CAP - counts.get(tok_key, 0)), **options)
-            done = int(resp.get("_chunks_done") or 0) if isinstance(resp, dict) else 0
-            total = int(resp.get("_chunks_total") or 0) if isinstance(resp, dict) else 0
-            sent_units = max(0, done - start_chunk)
-            if isinstance(resp, dict) and total:
-                job["chunks_done"] = done
-
-        if isinstance(resp, dict) and resp.get("_deferred"):
-            job["budget_deferred"] = True
-            job["attempts"] = attempts
-            job["next_attempt_at"] = 0
-            _return_to_pending(store, sending_path, pending_path, job)
-            return True
-
-        if is_token_invalid(resp):
-            # P4：先探活，探活也 -14 才判失效
-            if probe_token_invalid(store, baseurl, token):
-                mark_needs_relogin(store, "sendmessage -14 且探活 -14，token 确认失效")
-                log("token 确认失效，已写 NEEDS_RELOGIN，任务留队", job=name)
-                job["next_attempt_at"] = 0
-                _return_to_pending(store, sending_path, pending_path, job)
-                return False
-            log("sendmessage 返回 -14 但探活正常，按可重试失败处理",
-                job=name, attempt=attempt_no)
-            resp = {"ret": -14, "errmsg": "send -14, probe ok"}
-
-        if resp_ok(resp):
+        if _accepted_envelope(job):
             _mark_sent(store, sending_path, name)
-            log("已发送回复", job=name, attempt=attempt_no)
+            log("回复获 API 接纳", job=name, attempt=attempt_no)
             if PACE_SECONDS > 0:
                 time.sleep(PACE_SECONDS)
             return True
-
-        # 可重试失败：记 attempts/退避，或进死信
-        reason = "发送返回异常: %s" % str(resp)[:200]
-        job["attempts"] = attempt_no
-        job["last_error"] = reason
-        if attempt_no >= MAX_ATTEMPTS or (time.time() - enqueued_at) > MAX_JOB_AGE:
+        if job["delivery_state"] == _FINAL_INFLIGHT:
             _fail_job(store, sending_path, name, job,
-                      "attempts=%d 后仍失败: %s" % (attempt_no, reason))
-        else:
-            backoff = BACKOFFS[min(attempt_no - 1, len(BACKOFFS) - 1)]
-            job["next_attempt_at"] = time.time() + backoff
-            _return_to_pending(store, sending_path, pending_path, job)
-            log("%s；%ds 后重试" % (reason, backoff),
-                job=name, attempt=attempt_no)
-    except Exception as e:
-        if isinstance(e, BudgetUnavailable):
-            if e.code == "group_unknown":
-                _fail_job(store, sending_path, name, job,
-                          "unknown physical send result; reconciliation required")
-            else:
-                job.update(budget_deferred=True, attempts=attempts, next_attempt_at=0)
-                _return_to_pending(store, sending_path, pending_path, job)
+                      "final send result unconfirmed", "unknown")
+            if is_token_invalid(resp) and probe_token_invalid(store, baseurl, token):
+                mark_needs_relogin(store, "sendmessage -14 且探活 -14，token 确认失效")
+                return False
             return True
+        if isinstance(resp, dict) and resp.get("_deferred") is True:
+            requeue(0, deferred=True)
+            return True
+        _fail_job(store, sending_path, name, job,
+                  "send returned without durable confirmation", "unknown")
+    except Exception as error:
         if budget is not None:
             try:
                 budget.abort()
             except Exception:
-                pass  # Inflight stays durably unknown on restart.
-        # P2：单任务异常隔离——写回 pending 退避，绝不向上抛
-        try:
-            job["attempts"] = attempt_no
-            job["last_error"] = "异常: %s" % e
-            # 审查第 3 项：异常路径上也要保住分片进度（异常对象上挂着
-            # send_message 记下的已送达片数），否则重试从第一片重发。
-            exc_done = getattr(e, "_chunks_done", None)
-            if exc_done is not None:
-                job["chunks_done"] = int(exc_done)
-            if attempt_no >= MAX_ATTEMPTS:
-                _fail_job(store, sending_path, name, job,
-                          "attempts=%d 后异常: %s" % (attempt_no, e))
-            elif os.path.exists(sending_path):
-                backoff = BACKOFFS[min(attempt_no - 1, len(BACKOFFS) - 1)]
-                job["next_attempt_at"] = time.time() + backoff
-                _return_to_pending(store, sending_path, pending_path, job)
-            log("发送异常，已退避: %s" % e, job=name, attempt=attempt_no)
-        except Exception as e2:
-            log("发送异常且回写失败: %s / %s" % (e, e2), job=name)
+                pass  # The ledger retains unresolved physical sends.
+        if phase_write_failed:
+            log("发送阶段回写未确认，保留待恢复记录", job=name)
+            return True
+        if _accepted_envelope(job):
+            log("API 接纳已记录，待恢复归档", job=name)
+            return True
+        if (_delivery_uncertain(job) or
+                isinstance(error, BudgetUnavailable) and error.code == "group_unknown"):
+            _fail_job(store, sending_path, name, job,
+                      "final send result unconfirmed", "unknown")
+        elif isinstance(error, BudgetUnavailable):
+            requeue(0, deferred=True)
+        elif isinstance(error, OperationAborted):
+            if stop_event is not None and stop_event.is_set():
+                requeue(0)
+            else:
+                _fail_job(store, sending_path, name, job, "send authority lost: " + error.code)
+        elif attempt_no >= MAX_ATTEMPTS:
+            _fail_job(store, sending_path, name, job, "send preparation attempts exhausted")
+        else:
+            delay = BACKOFFS[min(attempt_no - 1, len(BACKOFFS) - 1)]
+            requeue(time.time() + delay)
     return True
 
 
-def _send_single(store, baseurl, token, counts, c):
+def _send_single(store, baseurl, token, counts, c, stop_event=None):
     """发送单个任务：额度复检 → 原子认领 → _deliver_claimed。
 
     返回 False 仅当 token 确认失效。
@@ -962,7 +1129,7 @@ def _send_single(store, baseurl, token, counts, c):
         return True
     return _deliver_claimed(store, baseurl, token, counts, name, job,
                             c["sending_path"], c["pending_path"],
-                            c["enq"], int(job.get("attempts") or 0))
+                            c["enq"], int(job.get("attempts") or 0), stop_event)
 
 
 def _archive_merge_member(store, name, job, anchor):
@@ -977,14 +1144,16 @@ def _archive_merge_member(store, name, job, anchor):
             pass
 
 
-def _send_merged_group(store, baseurl, token, counts, members):
+def _send_merged_group(store, baseurl, token, counts, members, stop_event=None):
     """Persist the complete envelope BEFORE sending; never split after a send.
 
-    Even a read timeout may follow server acceptance. Retrying a stable batch
-    preserves both its text and client ID; member aliases are never deliveries.
+    The anchor retains the send outcome. Member aliases are queue coverage.
     """
     newest = members[-1]
     name = newest["name"]
+    authority = _send_authority(newest["job"])
+    if any(_send_authority(member["job"]) != authority for member in members):
+        raise ValueError("conflicting send authority in merge group")
     claimed = []
     try:
         for member in members:
@@ -1009,7 +1178,7 @@ def _send_merged_group(store, baseurl, token, counts, members):
                 covers.append(str(mid))
     envelope["covers_message_ids"] = covers
     envelope["enqueued_at"] = min(m["enq"] for m in members)
-    envelope["delivery_state"] = "prepared"
+    envelope["delivery_state"] = _SEND_READY
     # A crash at any following point can discover this manifest and suppress
     # the remaining original members, even before their aliases were written.
     atomic_write_json(newest["sending_path"], envelope)
@@ -1018,10 +1187,10 @@ def _send_merged_group(store, baseurl, token, counts, members):
     log("prepared durable merged reply (%d members)" % len(members), job=name)
     return _deliver_claimed(store, baseurl, token, counts, name, envelope,
                             newest["sending_path"], newest["pending_path"],
-                            envelope["enqueued_at"], int(envelope.get("attempts", 0)))
+                            envelope["enqueued_at"], int(envelope.get("attempts", 0)), stop_event)
 
 
-def flush_outbox(store, baseurl, token):
+def flush_outbox(store, baseurl, token, stop_event=None):
     """把 outbox/pending/ 里的回复发出去（P1–P4 + 合并兜底语义）。
 
     先逐任务定性（死信/退避跳过/候选），再把候选里的连发纯文本任务
@@ -1030,13 +1199,15 @@ def flush_outbox(store, baseurl, token):
     其余任务逐条发。返回 False 仅当确认 token 失效，run() 据此退出 serve；
     其余异常都逐单元吞掉记日志，绝不向上抛。
     """
-    _recover_sending(store)
+    conflicting_anchors = _recover_sending(store)
     counts = _token_counts(store)
     last_ctx = load_json(store.last_ctx_path) or {}
     if not isinstance(last_ctx, dict):
         last_ctx = {}
-    session = load_json(store.session_path) or {}
-    owner = session.get("ilink_user_id") if isinstance(session, dict) else None
+    session = load_json(store.session_path)
+    if not isinstance(session, dict):
+        session = {}
+    owner = session.get("ilink_user_id")
     now = time.time()
 
     # —— 预处理：逐任务定性，不产生发送副作用 ——
@@ -1048,12 +1219,34 @@ def flush_outbox(store, baseurl, token):
         try:
             if _ordinary_original_blocked(store, name, job):
                 continue
+            terminal_paths = [os.path.join(directory, name)
+                              for directory in (store.sent_dir, store.failed_dir)
+                              if os.path.lexists(os.path.join(directory, name))]
+            if terminal_paths:
+                if any(_conflicting_bound_authority(job, load_json(path) or {})
+                       for path in terminal_paths):
+                    log("conflicting delivery copies require manual review", job=name)
+                    blocked_users.add(job.get("to_user_id"))
+                else:
+                    os.unlink(pending_path)
+                continue
+            if name in conflicting_anchors or os.path.lexists(sending_path):
+                blocked_users.add(job.get("to_user_id"))
+                continue
             job["enqueued_at"] = enq
             attempts = int(job.get("attempts") or 0)
+            if _delivery_uncertain(job) or _accepted_envelope(job):
+                os.replace(pending_path, sending_path)
+                if _accepted_envelope(job) and not _delivery_uncertain(job):
+                    _mark_sent(store, sending_path, name)
+                else:
+                    _fail_job(store, sending_path, name, job,
+                              "unverified previous send; reconciliation required", "unknown")
+                continue
             if job.get("to_user_id") in blocked_users:
                 continue
             # P1：次数/年龄到顶 → 死信
-            if attempts >= MAX_ATTEMPTS or (now - enq) > MAX_JOB_AGE:
+            if attempts >= MAX_ATTEMPTS or (now - enq) >= MAX_JOB_AGE:
                 try:
                     os.replace(pending_path, sending_path)
                 except OSError:
@@ -1076,7 +1269,8 @@ def flush_outbox(store, baseurl, token):
                           "任务无效：缺 to_user_id 或内容为空")
                 continue
             # P3(c)：未尝试过的任务，若有更新的同用户 token 则升级
-            if attempts == 0 or job.get("budget_deferred"):
+            if ((attempts == 0 or job.get("budget_deferred"))
+                    and job.get("login_epoch") in (None, session.get("login_epoch"))):
                 new_tok = last_ctx.get("context_token") or ""
                 if (new_tok and last_ctx.get("to_user_id") == to_user_id
                         and new_tok != (job.get("context_token") or "")):
@@ -1111,6 +1305,7 @@ def flush_outbox(store, baseurl, token):
     for c in candidates:
         if _is_mergeable_text(c["name"], c["job"]):
             if (group and c["job"].get("to_user_id") == group_user
+                    and _send_authority(c["job"]) == _send_authority(group[0]["job"])
                     and c["enq"] - group_anchor <= MERGE_WINDOW_SECONDS):
                 group.append(c)
             else:
@@ -1126,6 +1321,8 @@ def flush_outbox(store, baseurl, token):
     # —— 逐单元发送 ——
     blocked_users = set()
     for _anchor, members in units:
+        if stop_event is not None and stop_event.is_set():
+            return True
         newest = members[-1]
         recipient = newest["job"].get("to_user_id")
         if recipient in blocked_users:
@@ -1147,10 +1344,10 @@ def flush_outbox(store, baseurl, token):
                         job=newest["name"])
                     blocked_users.add(recipient)
                     continue
-                if not _send_merged_group(store, baseurl, token, counts, members):
+                if not _send_merged_group(store, baseurl, token, counts, members, stop_event):
                     return False
             else:
-                if not _send_single(store, baseurl, token, counts, members[0]):
+                if not _send_single(store, baseurl, token, counts, members[0], stop_event):
                     return False
             if any(os.path.exists(m["pending_path"]) or os.path.exists(m["sending_path"])
                    for m in members):
@@ -1159,7 +1356,7 @@ def flush_outbox(store, baseurl, token):
             blocked_users.add(recipient)
             log("发送单元未预期异常（已隔离）: %s" % e, job=newest["name"])
     from .attachment_runtime import flush_groups
-    flush_groups(store, baseurl, token)
+    flush_groups(store, baseurl, token, stop_event)
     return True
 
 
@@ -1171,6 +1368,7 @@ def _acquire_lock(store):
     except (OSError, IOError):
         return False
     _lock_fhs.append(fh)
+    store._cdn_guard_fds = (fh.fileno(),)
     return True
 
 
@@ -1180,7 +1378,7 @@ def _bot_lock_root():
     return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "wbridge", "bot-locks")
 
 
-def _acquire_bot_lock(session):
+def _acquire_bot_lock(session, *, store=None):
     """Prevent two state directories in this user runtime polling one bot."""
     import hashlib
     import stat
@@ -1201,6 +1399,10 @@ def _acquire_bot_lock(session):
         handle.close()
         return False
     _lock_fhs.append(handle)
+    if store is not None:
+        guards = getattr(store, "_cdn_guard_fds", ())
+        if guards:
+            store._cdn_guard_fds = guards + (handle.fileno(),)
     return True
 
 
@@ -1209,17 +1411,18 @@ def _recover_sending(store):
     try:
         names = [n for n in os.listdir(store.sending_dir) if n.endswith(".json")]
     except OSError:
-        return
+        return set()
     if not names:
-        return
+        return set()
+    conflicting_anchors = set()
     records = {}
     anchors = {}
     for directory in (store.sent_dir, store.failed_dir, store.pending_dir, store.sending_dir):
         try:
-            names = os.listdir(directory)
+            directory_names = os.listdir(directory)
         except OSError:
             continue
-        for name in names:
+        for name in directory_names:
             if not name.endswith(".json"):
                 continue
             try:
@@ -1238,44 +1441,90 @@ def _recover_sending(store):
     for name in sorted(names, key=lambda n: n not in anchors):
         src = os.path.join(store.sending_dir, name)
         dst = os.path.join(store.pending_dir, name)
+        anchor = None
         try:
             job = load_json(src)
             if not isinstance(job, dict):
-                os.replace(src, dst)
+                if os.path.lexists(dst):
+                    log("conflicting delivery copies require manual review", job=name)
+                else:
+                    os.replace(src, dst)
                 continue
             if _ordinary_original_blocked(store, name, job):
                 continue
             anchor = anchors.get(name) or job.get("merged_into")
+            terminal_paths = [os.path.join(directory, name)
+                              for directory in (store.sent_dir, store.failed_dir)
+                              if os.path.lexists(os.path.join(directory, name))]
+            if any(_conflicting_bound_authority(job, load_json(path))
+                   for path in terminal_paths):
+                if anchor:
+                    conflicting_anchors.add(anchor)
+                log("conflicting delivery copies require manual review", job=name)
+                continue
             if anchor:
                 if anchor not in records:
                     _fail_job(store, src, name, job, "missing canonical merge envelope; manual review required")
+                elif (_send_authority(job) != _send_authority(records[anchor])
+                      or _conflicting_bound_authority(job, load_json(dst))):
+                    conflicting_anchors.add(anchor)
+                    log("conflicting merge authority requires manual review", job=name)
                 else:
                     _archive_merge_member(store, name, job, anchor)
                 continue
-            if (os.path.exists(os.path.join(store.sent_dir, name)) or
-                    os.path.exists(os.path.join(store.failed_dir, name))):
-                # Sent transition already committed, only old source cleanup
-                # failed. Never resurrect a committed completed identity.
+            if name in conflicting_anchors:
+                continue
+            if terminal_paths:
+                # A terminal copy confirms which stale source may be removed.
                 os.unlink(src)
                 continue
             existing = load_json(dst)
-            if isinstance(existing, dict) and existing.get("client_key") == job.get("client_key"):
-                if any(existing.get(k) != job.get(k) for k in ("text", "media_path", "to_user_id")):
+            if isinstance(existing, dict) and _conflicting_bound_authority(existing, job):
+                log("conflicting delivery copies require manual review", job=name)
+                continue
+            if _job_schema_error(job):
+                _fail_job(store, src, name, job, "invalid interrupted send record", "unknown")
+                continue
+            if _delivery_uncertain(job):
+                _fail_job(store, src, name, job,
+                          "interrupted final send; reconciliation required", "unknown")
+                continue
+            if _accepted_envelope(job):
+                _mark_sent(store, src, name)
+                continue
+            enqueued_at = _job_enqueued_at(src, job)
+            if os.path.lexists(dst):
+                if (_job_schema_error(existing) or _send_authority(existing) != _send_authority(job)
+                        or any(existing.get(k) != job.get(k)
+                        for k in ("client_key", "text", "media_path", "to_user_id"))):
                     log("conflicting delivery copies require manual review", job=name)
                     continue
+                if _delivery_uncertain(existing):
+                    _fail_job(store, src, name, existing,
+                              "uncertain pending copy; reconciliation required", "unknown")
+                    continue
+                if _accepted_envelope(existing):
+                    atomic_write_json(src, existing)
+                    _mark_sent(store, src, name)
+                    continue
                 pending = dict(existing)
+                enqueued_at = min(enqueued_at, _job_enqueued_at(dst, existing))
                 pending["chunks_done"] = max(int(existing.get("chunks_done") or 0), int(job.get("chunks_done") or 0))
                 pending["attempts"] = max(int(existing.get("attempts") or 0), int(job.get("attempts") or 0))
                 pending["next_attempt_at"] = max(float(existing.get("next_attempt_at") or 0), float(job.get("next_attempt_at") or 0))
                 job = pending
             else:
                 job.setdefault("next_attempt_at", 0)
-            job["delivery_state"] = "recovered"
+            job.update(delivery_state=_SEND_READY, enqueued_at=enqueued_at)
             atomic_write_json(dst, job)
             os.unlink(src)
             log("recovered interrupted delivery", job=name)
         except (OSError, ValueError, TypeError) as error:
+            if isinstance(anchor, str):
+                conflicting_anchors.add(anchor)
             log("delivery recovery pending: %s" % error, job=name)
+
+    return conflicting_anchors
 
 
 def _poll_response_bad(resp):
@@ -1361,12 +1610,15 @@ def run(store, baseurl, token, owner_id):
     dispatcher = None
     try:
         config = load_config(store)
-        if not _acquire_bot_lock(current):
+        if not _acquire_bot_lock(current, store=store):
             log("该 bot 已有另一个收件进程；请使用独立 bot 和状态目录")
             return 1
         if config is not None:
+            from .attachment_runtime import ensure_identity
             from .dispatcher import Dispatcher
             preflight(store, config, current)
+            # Managed backends share the outbox but skip attachment bootstrap.
+            current = ensure_identity(store)
             dispatcher = Dispatcher(store, config, owner_id, current["ilink_bot_id"])
             dispatcher.acquire()
             store.managed_inbox_dir = dispatcher.inbox
@@ -1382,6 +1634,7 @@ def run(store, baseurl, token, owner_id):
         ("attachments_enabled.json", "attachments.sqlite3", "attachment-delivery.sqlite3"))
     new_state_exists = new_state_exists or os.path.lexists(os.path.join(store.base, "attachments"))
     legacy_embedded = (not os.path.lexists(store.session_path) and not new_state_exists)
+    store._send_session_required = not legacy_embedded or isinstance(current, dict)
     if config is None and legacy_embedded:
         store._attachments_disabled = True
     if config is None and not legacy_embedded:
@@ -1422,7 +1675,11 @@ def run(store, baseurl, token, owner_id):
         """锁内跑一轮 flush。出 False 仅当 token 确认失效。"""
         with flush_lock:
             try:
-                return flush_outbox(store, baseurl, token)
+                return flush_outbox(store, baseurl, token, stop_event)
+            except CDNReapError:
+                stop_event.set()
+                log("CDN 执行者退出未确认，停止服务并保留发送状态")
+                return True
             except Exception as e:
                 # P2：flush 异常永不杀任何线程
                 log("flush_outbox 未预期异常（已吞）: %s" % e)
@@ -1458,7 +1715,9 @@ def run(store, baseurl, token, owner_id):
     poll_timeout = 45
     try:
         while True:
-            if stop_event.is_set() or os.path.exists(store.needs_relogin_path):
+            if stop_event.is_set():
+                return 1
+            if os.path.exists(store.needs_relogin_path):
                 log("NEEDS_RELOGIN 存在，退出 serve。")
                 return 1
             # P1-1 监督 (1)：flusher 死了且不在收尾 → 进程内重启。
@@ -1524,8 +1783,9 @@ def run(store, baseurl, token, owner_id):
             elif not isinstance(messages, list):
                 # A schema-invalid batch is acknowledged only after its raw
                 # contents are durably quarantined and a visible status exists.
-                batch_ok = _quarantine_incoming(store, resp, "msgs_not_array")
+                batch_ok = _quarantine_incoming(store, resp, "msgs_not_array", reference_gap=True)
                 messages = []
+            from .attachment_runtime import reference_continuity_active
             for msg in messages:
                 try:
                     if handle_incoming(store, msg, owner_id) is False:
@@ -1534,6 +1794,9 @@ def run(store, baseurl, token, owner_id):
                 except Exception as e:
                     batch_ok = False
                     log("处理消息出错，本批游标不推进（%s）" % type(e).__name__)
+                if not batch_ok and reference_continuity_active(store):
+                    # Later events must not leapfrog an unacknowledged event.
+                    break
             new_buf = resp.get("get_updates_buf")
             if new_buf is not None and not isinstance(new_buf, str):
                 _quarantine_incoming(store, resp, "cursor_not_string")

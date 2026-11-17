@@ -7,6 +7,7 @@
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -26,7 +27,7 @@ from .ilink import (
     _stable_client_id, auth_headers, base_info, http_json, is_token_invalid,
     resp_ok,
 )
-from .store import log
+from .store import atomic_write_text, log
 from .image_validation import ImageValidationBudget
 from .media_diagnostics import REASONS, MAX_DOWNLOADED_BYTES
 from .progress import OperationAborted, checkpoint
@@ -307,9 +308,43 @@ def _original_stage_fd(directory_fd, name):
             os.close(fresh_fd)
 
 
+
+# Local recovery policy, not a platform limit: one fresh GET after a proven
+# incomplete image body. All attempts share the original source timeout budget.
+IMAGE_GET_ATTEMPTS = 2
+
+
+def _comparable_body_length(response):
+    """Only raw identity bodies with a single valid CL are comparable.
+
+    Optional/hostile metadata remains compatible, never promoted to evidence of
+    a short body. Transfer framing and content coding cannot be mixed with CL.
+    """
+    try:
+        headers = response.headers
+        if headers.get("Transfer-Encoding") is not None:
+            return None
+        encoding = headers.get("Content-Encoding")
+        if encoding is not None and (type(encoding) is not str or encoding.strip(" \t").lower() != "identity"):
+            return None
+        get_all = getattr(headers, "get_all", None)
+        values = get_all("Content-Length") if callable(get_all) else [headers.get("Content-Length")]
+        if not values or len(values) != 1:
+            return None
+        value = values[0]
+        if type(value) is not str:
+            return None
+        value = value.strip(" \t")
+        if not re.fullmatch(r"[0-9]{1,19}", value):
+            return None
+        length = int(value)
+        return length if length <= 2**63 - 1 else None
+    except Exception:
+        return None
+
 def download_media(media, aes_key_override=None, dest_path=None, expected_type=None,
                    diagnostics=None, failure_capture=None, preserve_original=False,
-                   metadata=None, progress=None):
+                   metadata=None, progress=None, *, classify_plain_text=False):
     """从微信 CDN 下载并解密媒体文件。
 
     media: dict，含 encrypt_query_param / full_url / aes_key。
@@ -361,122 +396,179 @@ def download_media(media, aes_key_override=None, dest_path=None, expected_type=N
 
     download_progress = 0
     checkpoint(progress, "download", 0, None)
+    request_timeout = 60 if preserve_original else 120
     for source_attempt, (name, url) in enumerate(urls, 1):
-        data = None
-        if validator is not None and not validator.limited:
-            validator.checked, validator.reason = False, "ok"
-        started = time.monotonic()
-        diagnostic = {"event": "media_receive", "diagnostic_version": 2,
-                      "outcome_scope": "download_decrypt",
-                      "transfer_id": transfer_id, "source": name,
-                      "source_attempt": source_attempt, "source_count": len(urls), "stage": "http",
-                      "bytes": None, "block_aligned": None, "magic": "other",
-                      "magic_scope": "http_response_body", "block_remainder": None,
-                      "body_length_matches_content_length": None,
-                      "keys": {"item.aeskey": _key_metadata(aes_key_override),
-                               "media.aes_key": _key_metadata(media.get("aes_key"), "aes_key" in media)},
-                      "attempted": [], "expected_type": "image" if expected_type == "image" else "generic"}
-        diagnostic.update(_response_metadata(None, url))
-        failure_reason = "request_or_http_error"
+        source_deadline = time.monotonic() + request_timeout
+        for request_attempt in range(1, (IMAGE_GET_ATTEMPTS if expected_type == "image" else 1) + 1):
+            data, chunks = None, []
+            received = 0
+            capture_allowed = True
+            if validator is not None and not validator.limited:
+                validator.checked, validator.reason = False, "ok"
+            started = time.monotonic()
+            diagnostic = {"event": "media_receive", "diagnostic_version": 2,
+                          "outcome_scope": "download_decrypt",
+                          "transfer_id": transfer_id, "source": name,
+                          "source_attempt": source_attempt, "source_count": len(urls), "stage": "http",
+                          "request_attempt": request_attempt, "retry_planned": False,
+                          "bytes": None, "block_aligned": None, "magic": "other",
+                          "magic_scope": "http_response_body", "block_remainder": None,
+                          "body_length_matches_content_length": None,
+                          "keys": {"item.aeskey": _key_metadata(aes_key_override),
+                                   "media.aes_key": _key_metadata(media.get("aes_key"), "aes_key" in media)},
+                          "attempted": [], "expected_type": "image" if expected_type == "image" else "generic"}
+            diagnostic.update(_response_metadata(None, url))
+            failure_reason = "request_or_http_error"
 
-        def emit():
-            diagnostic["elapsed_ms"] = min(3600000, max(0, int((time.monotonic() - started) * 1000)))
-            diagnostic["attempted_count"] = len(diagnostic["attempted"])
-            # All entries originate in fixed local strategy names, not response data.
-            diagnostic["attempted_truncated"] = len(diagnostic["attempted"]) > 128
-            diagnostic["attempted"] = diagnostic["attempted"][:128]
-            log("media_receive " + json.dumps(diagnostic, separators=(",", ":")))
+            def emit():
+                diagnostic["elapsed_ms"] = min(3600000, max(0, int((time.monotonic() - started) * 1000)))
+                diagnostic["attempted_count"] = len(diagnostic["attempted"])
+                # All entries originate in fixed local strategy names, not response data.
+                diagnostic["attempted_truncated"] = len(diagnostic["attempted"]) > 128
+                diagnostic["attempted"] = diagnostic["attempted"][:128]
+                log("media_receive " + json.dumps(diagnostic, separators=(",", ":")))
 
-        try:
-            checkpoint(progress, "download", download_progress, None)
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=60 if preserve_original else 120) as resp:
-                diagnostic.update(_response_metadata(resp, url))
-                failure_reason = "http_body_read_failed"
-                if progress is None:
-                    data = resp.read(cipher_limit + 1)
-                else:
-                    chunks, received = [], 0
-                    while received <= cipher_limit:
-                        chunk = resp.read(min(65536, cipher_limit + 1 - received))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        received += len(chunk)
-                        download_progress += len(chunk)
-                        checkpoint(progress, "download", download_progress, None)
-                    data = b"".join(chunks)
-            diagnostic.update(bytes=len(data), block_aligned=bool(data) and len(data) % 16 == 0,
-                              block_remainder=len(data) % 16, magic=crypto.image_magic(data),
-                              body_length_matches_content_length=(len(data) == diagnostic["content_length"]
-                                  if diagnostic["content_length"] is not None else None))
-            if len(data) > cipher_limit:
-                failure_reason = "ciphertext_too_large"
-                raise ValueError("媒体密文超过本地大小上限")
-            diagnostic["stage"] = "decrypt"
-            failure_reason = ("empty_body" if not data else "ciphertext_not_block_aligned"
-                              if len(data) % 16 else "decrypt_no_candidate")
             try:
-                if preserve_original:
-                    candidate, strategy, original_metadata = _decrypt_original(
-                        data, media, aes_key_override, expected_type,
-                        diagnostic["attempted"], validator)
-                else:
-                    candidate, strategy = _decrypt_media(
-                        data, media, aes_key_override, expected_type,
-                        diagnostic["attempted"], validator=validator)
-            except ValueError as error:
-                # A legal CBC IV can itself start with an image signature.
-                # Try keyed decoding before the plaintext fallback; never turn
-                # an ambiguous decryption into a successful raw-cipher save.
-                if (error.args == ("media_decrypt_ambiguous",)
-                        or expected_type != "image" or crypto.image_magic(data) == "other"):
-                    raise
-                candidate, strategy = data, "plaintext-image"
-                diagnostic["attempted"].append(strategy)
-                if preserve_original and (validator is None or not validator(data)):
-                    raise ValueError("media_image_validation_failed")
-                original_metadata = {"decryption_state": "plaintext_verified",
-                                     "preview_state": "readable",
-                                     "detected_type": crypto.image_magic(data)}
-            if len(candidate) > MAX_MEDIA_BYTES:
-                failure_reason = "plaintext_too_large"
-                raise ValueError("媒体明文超过 100MB 上限")
-            if not preserve_original and validator is not None and not validator(candidate):
-                failure_reason = validator.reason
-                raise ValueError("media_image_validation_failed")
-            checkpoint(progress, "decrypt", len(candidate), len(candidate))
-            if preserve_original and isinstance(metadata, dict):
-                metadata.update(original_metadata)
-            diagnostic.update(outcome="success", strategy=strategy,
-                              plaintext_magic=crypto.image_magic(candidate))
-            emit()
-            collect(name, "success", len(data), "ok")
-            plain = candidate
-            break  # 完整下载、解密及大小校验成功后才认定此源成功
-        except Exception as e:
-            if isinstance(e, OperationAborted):
-                raise
-            # HTTPError/URLError/Request exception text can contain the entire
-            # signed URL. Only fixed classifications may leave this function.
-            error = "http_failed" if diagnostic["stage"] == "http" else "decrypt_or_size_failed"
-            if isinstance(e, ValueError) and e.args == ("media_decrypt_ambiguous",):
-                error = "decrypt_ambiguous"
-                failure_reason = "decrypt_ambiguous"
-            elif (diagnostic["stage"] == "decrypt" and validator is not None
-                  and validator.checked and validator.reason != "ok"
-                  and failure_reason in ("empty_body", "ciphertext_not_block_aligned", "decrypt_no_candidate")):
-                failure_reason = validator.reason
-            diagnostic.update(outcome="failed", error=error, failure_reason=failure_reason)
-            if isinstance(e, urllib.error.HTTPError):
-                diagnostic.update(_response_metadata(e, url))
+                checkpoint(progress, "download", download_progress, None)
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                remaining = source_deadline - time.monotonic()
+                if expected_type == "image" and remaining <= 0:
+                    failure_reason = "http_body_read_failed"
+                    raise ValueError("image_source_budget_exhausted")
+                with urllib.request.urlopen(req, timeout=(min(request_timeout, remaining)
+                        if expected_type == "image" and request_attempt > 1 else request_timeout)) as resp:
+                    diagnostic.update(_response_metadata(resp, url))
+                    expected_length = _comparable_body_length(resp)
+                    if expected_length is not None:
+                        diagnostic.update(content_length=expected_length, content_length_state="valid")
+                    failure_reason = "http_body_read_failed"
+                    if progress is None:
+                        data = resp.read(cipher_limit + 1)
+                        received = len(data)
+                    else:
+                        while received <= cipher_limit:
+                            if expected_type == "image" and time.monotonic() >= source_deadline:
+                                failure_reason = "http_body_read_failed"
+                                raise ValueError("image_source_budget_exhausted")
+                            chunk = resp.read(min(65536, cipher_limit + 1 - received))
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            received += len(chunk)
+                            download_progress += len(chunk)
+                            checkpoint(progress, "download", download_progress, None)
+                        data = b"".join(chunks)
+                diagnostic.update(bytes=len(data), block_aligned=bool(data) and len(data) % 16 == 0,
+                                  block_remainder=len(data) % 16, magic=crypto.image_magic(data),
+                                  body_length_matches_content_length=(len(data) == diagnostic["content_length"]
+                                      if diagnostic["content_length"] is not None else None))
+                if len(data) > cipher_limit:
+                    failure_reason = "ciphertext_too_large"
+                    raise ValueError("媒体密文超过本地大小上限")
+                if expected_length is not None and len(data) != expected_length:
+                    failure_reason = ("http_body_incomplete" if len(data) < expected_length
+                                      else "http_body_read_failed")
+                    # Extending integrity checks must not enroll newly rejected
+                    # generic bodies in the optional private sample collector.
+                    capture_allowed = expected_type == "image"
+                    raise ValueError("media_http_body_length_mismatch")
+                diagnostic["stage"] = "decrypt"
+                failure_reason = ("empty_body" if not data else "ciphertext_not_block_aligned"
+                                  if len(data) % 16 else "decrypt_no_candidate")
                 try:
-                    e.close()
-                except Exception:
-                    pass
-            emit()
-            collect(name, "failed", len(data) if data is not None else None, failure_reason)
-            capture(name, data, failure_reason)
+                    if preserve_original:
+                        candidate, strategy, original_metadata = _decrypt_original(
+                            data, media, aes_key_override, expected_type,
+                            diagnostic["attempted"], validator, classify_plain_text=classify_plain_text)
+                    else:
+                        candidate, strategy = _decrypt_media(
+                            data, media, aes_key_override, expected_type,
+                            diagnostic["attempted"], validator=validator)
+                except ValueError as error:
+                    # A legal CBC IV can itself start with an image signature.
+                    # Try keyed decoding before the plaintext fallback; never turn
+                    # an ambiguous decryption into a successful raw-cipher save.
+                    if (error.args == ("media_decrypt_ambiguous",)
+                            or expected_type != "image" or crypto.image_magic(data) == "other"):
+                        raise
+                    candidate, strategy = data, "plaintext-image"
+                    diagnostic["attempted"].append(strategy)
+                    if preserve_original and (validator is None or not validator(data)):
+                        raise ValueError("media_image_validation_failed")
+                    original_metadata = {"decryption_state": "plaintext_verified",
+                                         "preview_state": "readable",
+                                         "detected_type": crypto.image_magic(data)}
+                if len(candidate) > MAX_MEDIA_BYTES:
+                    failure_reason = "plaintext_too_large"
+                    raise ValueError("媒体明文超过 100MB 上限")
+                if not preserve_original and validator is not None and not validator(candidate):
+                    failure_reason = validator.reason
+                    raise ValueError("media_image_validation_failed")
+                checkpoint(progress, "decrypt", len(candidate), len(candidate))
+                if preserve_original and isinstance(metadata, dict):
+                    metadata.update(original_metadata)
+                diagnostic.update(outcome="success", strategy=strategy,
+                                  plaintext_magic=crypto.image_magic(candidate))
+                emit()
+                collect(name, "success", len(data), "ok")
+                plain = candidate
+                break  # 完整下载、解密及大小校验成功后才认定此源成功
+            except Exception as e:
+                if isinstance(e, OperationAborted):
+                    raise
+                if isinstance(e, http.client.IncompleteRead):
+                    partial = e.partial if isinstance(e.partial, bytes) else b""
+                    partial_size = min(len(partial), max(0, cipher_limit + 1 - received))
+                    observed = received + partial_size
+                    failure_reason = ("ciphertext_too_large" if observed > cipher_limit
+                                      else "http_body_incomplete")
+                    if expected_type == "image":
+                        previous = b"".join(chunks)
+                        data = previous + partial[:partial_size]
+                        diagnostic["magic"] = crypto.image_magic(data)
+                        if partial:
+                            download_progress += partial_size
+                            checkpoint(progress, "download", download_progress, None)
+                    # A returned prefix is evidence of bytes, not a complete
+                    # body for decryption/capture. Preserve that separation.
+                    diagnostic.update(bytes=observed, block_aligned=bool(observed) and observed % 16 == 0,
+                                      block_remainder=observed % 16)
+                elif diagnostic["bytes"] is None and (data is not None or received):
+                    observed = len(data) if data is not None else received
+                    diagnostic.update(bytes=observed, block_aligned=bool(observed) and observed % 16 == 0,
+                                      block_remainder=observed % 16)
+                # HTTPError/URLError/Request exception text can contain the entire
+                # signed URL. Only fixed classifications may leave this function.
+                error = "http_failed" if diagnostic["stage"] == "http" else "decrypt_or_size_failed"
+                if isinstance(e, ValueError) and e.args == ("media_decrypt_ambiguous",):
+                    error = "decrypt_ambiguous"
+                    failure_reason = "decrypt_ambiguous"
+                elif (diagnostic["stage"] == "decrypt" and validator is not None
+                      and validator.checked and validator.reason != "ok"
+                      and failure_reason in ("empty_body", "ciphertext_not_block_aligned", "decrypt_no_candidate")):
+                    failure_reason = validator.reason
+                diagnostic.update(outcome="failed", error=error, failure_reason=failure_reason)
+                if isinstance(e, urllib.error.HTTPError):
+                    diagnostic.update(_response_metadata(e, url))
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                retry = (expected_type == "image" and failure_reason == "http_body_incomplete"
+                         and request_attempt < IMAGE_GET_ATTEMPTS
+                         and time.monotonic() < source_deadline)
+                diagnostic["retry_planned"] = retry
+                emit()
+                if retry:
+                    # Only actual work checkpoints; never renew a lease on a timer.
+                    checkpoint(progress, "download", download_progress, None)
+                    continue
+                collect(name, "failed", diagnostic["bytes"], failure_reason)
+                if capture_allowed:
+                    capture(name, data, failure_reason)
+                break
+        if plain is not None:
+            break
     if plain is None:
         raise ValueError("media_receive_all_sources_failed") from None
 
@@ -534,7 +626,8 @@ def download_media(media, aes_key_override=None, dest_path=None, expected_type=N
     return dest_path
 
 
-def _decrypt_original(encrypted, media, key_override, expected_type, attempted, validator):
+def _decrypt_original(encrypted, media, key_override, expected_type, attempted, validator,
+                      *, classify_plain_text=False):
     """Protocol bytes and content readability are independent facts.
 
     Only parsed protocol ECB candidates can admit an unknown file format.
@@ -582,6 +675,11 @@ def _decrypt_original(encrypted, media, key_override, expected_type, attempted, 
         details["detected_type"] = ("HEIC" if brand in
             (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1") else
             "AVIF" if brand in (b"avif", b"avis") else "MP4")
+    elif classify_plain_text and len(selected) <= 65536 and re.fullmatch(
+            rb"[ \t\r\n]*[A-Za-z]{3,}[ \t][ -~\t\r\n]+", selected):
+        # Recognize a narrow plain-text form from complete decoded bytes.
+        # Other formats remain unverified, including textual image formats.
+        details["detected_type"] = "text/plain"
     return selected, strategy, details
 
 
@@ -643,6 +741,33 @@ def _decrypt_media(encrypted, media, aes_key_override, expected_type=None, attem
     raise ValueError("media_decrypt_failed")
 
 
+
+_SEND_STAGES = frozenset(("file_read", "getuploadurl", "cdn_upload", "sendmessage", "settle"))
+
+
+class MediaSendError(RuntimeError, ValueError):
+    """Safe local phase category; never carries remote response/exception text."""
+    def __init__(self, stage, http_status=None):
+        self.stage = stage if stage in _SEND_STAGES else "sendmessage"
+        self.code = "media_" + self.stage + "_failed"
+        self.http_status = _http_status(http_status)
+        super().__init__(self.code)
+
+
+def _send_event(stage, outcome, status=None, performed=None, *, started=None):
+    if stage not in _SEND_STAGES or outcome not in ("success", "failed"):
+        return
+    try:
+        record = {"event": "media_send", "diagnostic_version": 2,
+                  "stage": stage, "outcome": outcome, "http_status": _http_status(status)}
+        if type(performed) is bool:
+            record["performed"] = performed
+        if started is not None:
+            record["elapsed_ms"] = max(0, int((time.monotonic() - started) * 1000))
+        log("media_send " + json.dumps(record, separators=(",", ":")))
+    except Exception:
+        pass  # Diagnostics never decide whether a send was accepted.
+
 def _get_upload_target(baseurl, token, to_user_id, data, encrypted,
                        upload_media_type, aes_key, heartbeat=None):
     """调 getuploadurl（新 filekey），返回 (full_url, param_url)。两者可缺一。"""
@@ -662,46 +787,139 @@ def _get_upload_target(baseurl, token, to_user_id, data, encrypted,
     }
     # 二次审查 P3-6：getuploadurl 与 sendmessage 同属「发送」类调用，
     # 关掉传输层自动重试（理由见 ilink.send_message 注释）。
-    resp = http_json("POST", baseurl + "/ilink/bot/getuploadurl",
-                     auth_headers(token), body, timeout=30, retries=1)
-    if not resp_ok(resp, "upload"):
-        raise RuntimeError("getuploadurl 失败: %s" % str(resp)[:300])
-    full_url = (resp.get("upload_full_url") or "").strip()
-    param = resp.get("upload_param") or ""
-    param_url = ""
-    if param:
-        param_url = (CDN_BASE + "/upload?encrypted_query_param=" +
-                     urllib.parse.quote(param, safe="") +
-                     "&filekey=" + urllib.parse.quote(filekey, safe=""))
-    if not full_url and not param_url:
-        raise RuntimeError("getuploadurl 未返回上传地址")
+    started = time.monotonic()
+    try:
+        resp = http_json("POST", baseurl + "/ilink/bot/getuploadurl",
+                         auth_headers(token), body, timeout=30, retries=1)
+        if not resp_ok(resp, "upload"):
+            raise ValueError("upload_target_invalid")
+        full_url = (resp.get("upload_full_url") or "").strip()
+        param = resp.get("upload_param") or ""
+        param_url = ""
+        if param:
+            param_url = (CDN_BASE + "/upload?encrypted_query_param=" +
+                         urllib.parse.quote(param, safe="") +
+                         "&filekey=" + urllib.parse.quote(filekey, safe=""))
+        if not full_url and not param_url:
+            raise ValueError("upload_target_missing")
+    except OperationAborted:
+        raise
+    except Exception:
+        _send_event("getuploadurl", "failed", started=started)
+        raise MediaSendError("getuploadurl") from None
+    _send_event("getuploadurl", "success", started=started)
     return full_url, param_url
 
 
-def _post_cdn(url, form, encrypted):
-    """POST 密文到 CDN，返回 x-encrypted-param；失败抛带状态码的 RuntimeError。"""
-    req = urllib.request.Request(
-        url, data=encrypted,
-        headers={"Content-Type": "application/octet-stream",
-                 "User-Agent": "Mozilla/5.0"},
-        method="POST")
+def supervised_cdn_options(store, client_key, check, expires_at):
+    """Bind all CDN attempts to the existing queue authority and its expiry."""
+    guard_fds = getattr(store, "_cdn_guard_fds", ())
+    if not guard_fds:
+        return {}
+    from . import cdn_process
+    from .cdn_trial import trial_enabled, upload_attempt
+
+    deadline = time.monotonic() + max(0, expires_at - time.time())
+    enabled = trial_enabled()
+    unit_id = _stable_client_id(client_key, 0)
+    upload_id = uuid.uuid4().hex
+    attempt = 0
+    last_heartbeat = float("-inf")
+
+    def authority():
+        if time.time() >= expires_at or time.monotonic() >= deadline:
+            raise OperationAborted("expired")
+        check()
+
+    def upload(url, form, encrypted, plaintext_bytes):
+        nonlocal attempt
+        attempt += 1
+        started = time.monotonic()
+        last = {}
+
+        def emit(event):
+            try:
+                row = dict(event, diagnostic_version=1, unit_id=unit_id, upload_id=upload_id,
+                           attempt=attempt, target_form=form)
+                log("cdn_transport " + json.dumps(row, separators=(",", ":"), allow_nan=False))
+            except Exception:
+                pass  # Observation must not affect the transmission decision.
+
+        def report(event):
+            nonlocal last_heartbeat, last
+            last = event
+            emit(event)
+            try:
+                now = time.monotonic()
+                if (event.get("outcome") in ("success", "progress")
+                        and now - last_heartbeat >= 1):
+                    atomic_write_text(store.flusher_hb_path, str(time.time()))
+                    last_heartbeat = now
+            except Exception:
+                pass  # Observation must not affect the transmission decision.
+
+        def send(**policy):
+            return cdn_process.upload(url, encrypted, check=authority, deadline=deadline,
+                                      wall_deadline=expires_at, guard_fds=guard_fds, report=report,
+                                      **policy)
+
+        try:
+            return upload_attempt(store.state_dir, client_key, plaintext_bytes, enabled=enabled,
+                                  send=send, check=authority, deadline=deadline, wall_deadline=expires_at)
+        except (OperationAborted, cdn_process.CDNReapError, cdn_process.CDNUploadError) as error:
+            reason = "cdn_upload_failed"
+            if isinstance(error, OperationAborted):
+                reason = getattr(error, "trial_reason", error.code)
+            elif isinstance(error, cdn_process.CDNReapError):
+                reason = "cdn_worker_exit_unconfirmed"
+            else:
+                reason = error.reason
+            emit({"phase": last.get("phase", "transport"), "outcome": "attempt_failed",
+                  "attempt_elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+                  "bytes_written": last.get("bytes_written", 0), "bytes_total": len(encrypted),
+                  "error": reason,
+                  "http_status": getattr(error, "http_status", None)})
+            raise
+
+    return {"cdn_upload": upload}
+
+
+def _post_cdn(url, form, encrypted, *, cdn_upload=None, plaintext_bytes=None):
+    """Upload once; safe phase/status survives without remote exception text."""
+    status = None
+    started = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            status = r.status
-            download_param = r.headers.get("x-encrypted-param") or ""
-    except urllib.error.HTTPError as e:
-        log("CDN 上传失败 form=%s status=%s" % (form, e.code))
-        raise RuntimeError("CDN 上传 HTTP %s (form=%s)" % (e.code, form))
-    log("CDN 上传 form=%s status=%s" % (form, status))
-    if status != 200:
-        raise RuntimeError("CDN 上传 HTTP %s (form=%s)" % (status, form))
-    if not download_param:
-        raise RuntimeError("CDN 响应缺少 x-encrypted-param (form=%s)" % form)
+        if cdn_upload is None:
+            req = urllib.request.Request(url, data=encrypted,
+                headers={"Content-Type": "application/octet-stream", "User-Agent": "Mozilla/5.0"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=60) as response:
+                status = _http_status(response.status)
+                download_param = response.headers.get("x-encrypted-param") or ""
+        else:
+            status, download_param = cdn_upload(url, form, encrypted, plaintext_bytes)
+        if status != 200 or type(download_param) is not str or not download_param:
+            raise ValueError("cdn_response_invalid")
+    except OperationAborted:
+        raise
+    except urllib.error.HTTPError as error:
+        status = _http_status(error.code)
+        try:
+            error.close()
+        except Exception:
+            pass
+        _send_event("cdn_upload", "failed", status, started=started)
+        raise MediaSendError("cdn_upload", status) from None
+    except Exception as error:
+        status = _http_status(getattr(error, "http_status", status))
+        _send_event("cdn_upload", "failed", status, started=started)
+        raise MediaSendError("cdn_upload", status) from None
+    _send_event("cdn_upload", "success", status, started=started)
     return download_param
 
 
 def upload_media(baseurl, token, to_user_id, data, item_type, heartbeat=None,
-                 progress=None):
+                 progress=None, cdn_upload=None):
     """上传媒体到微信 CDN，返回 (encrypt_query_param, aes_key_b64, cipher_size)。
 
     P5：单次超时 60s；同一地址最多试 2 次；upload_full_url 吃 404 时，
@@ -742,6 +960,7 @@ def upload_media(baseurl, token, to_user_id, data, item_type, heartbeat=None,
 
     last_err = None
     fallback_used = False
+    post_options = {} if cdn_upload is None else {"cdn_upload": cdn_upload, "plaintext_bytes": len(data)}
     idx = 0
     while idx < len(candidates):
         form, url = candidates[idx]
@@ -751,7 +970,7 @@ def upload_media(baseurl, token, to_user_id, data, item_type, heartbeat=None,
                 checkpoint(progress, "upload", upload_step, None)
                 if heartbeat is not None:
                     heartbeat()
-                download_param = _post_cdn(url, form, encrypted)
+                download_param = _post_cdn(url, form, encrypted, **post_options)
                 advance_upload()
                 # 与官方插件一致：aes_key 取 32 位 hex 字符串再 base64
                 aes_key_b64 = base64.b64encode(
@@ -762,7 +981,7 @@ def upload_media(baseurl, token, to_user_id, data, item_type, heartbeat=None,
                     raise
                 advance_upload()
                 last_err = e
-                if "HTTP 404" in str(e) and form == "full_url" and not fallback_used:
+                if getattr(e, "http_status", None) == 404 and form == "full_url" and not fallback_used:
                     # 回退一次：新 filekey 重新取址，优先用 param 拼接地址
                     fallback_used = True
                     log("CDN full_url 返回 404，回退重新取址（新 filekey）")
@@ -778,16 +997,18 @@ def upload_media(baseurl, token, to_user_id, data, item_type, heartbeat=None,
                     except Exception as e2:
                         if isinstance(e2, OperationAborted):
                             raise
-                        log("回退取址失败: %s" % e2)
+                        log("回退取址失败: media_getuploadurl_failed")
                     break  # 转到下一个候选（已有 param 或刚追加的回退地址）
                 if attempt + 1 < 2:
                     time.sleep(2)
-    raise RuntimeError("CDN 上传失败: %s" % last_err)
+    # last_err remains internal; never stringify a remote exception/URL.
+    raise MediaSendError("cdn_upload", getattr(last_err, "http_status", None)) from None
 
 
 def send_media_message(baseurl, token, to_user_id, context_token, file_path,
                        item_type, caption="", client_key=None, heartbeat=None,
-                       progress=None, before_send=None, on_result=None, file_name=None):
+                       progress=None, before_send=None, on_result=None, file_name=None,
+                       cdn_upload=None):
     """发图片/视频/文件到微信（只发媒体本体）。
 
     P3：配文不再由本函数发送。旧实现先发配文再发媒体，媒体重试时会把
@@ -803,20 +1024,30 @@ def send_media_message(baseurl, token, to_user_id, context_token, file_path,
     服务端按 client_id 去重时可免重；没传才回退随机 uuid（旧行为）。
     """
     # O_NONBLOCK 避免在 fstat 能拒绝 FIFO 之前就卡在 open 上。
-    fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    with os.fdopen(fd, "rb") as f:
-        info = os.fstat(f.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError("只允许发送普通文件")
-        if info.st_size > MAX_MEDIA_BYTES:
+    started = time.monotonic()
+    try:
+        fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("只允许发送普通文件")
+            if info.st_size > MAX_MEDIA_BYTES:
+                raise ValueError("文件超过 100MB 上限")
+            # 即使文件在 fstat 后增长，也不能无界读取。
+            data = f.read(MAX_MEDIA_BYTES + 1)
+        if len(data) > MAX_MEDIA_BYTES:
             raise ValueError("文件超过 100MB 上限")
-        # 即使文件在 fstat 后增长，也不能无界读取。
-        data = f.read(MAX_MEDIA_BYTES + 1)
-    if len(data) > MAX_MEDIA_BYTES:
-        raise ValueError("文件超过 100MB 上限")
+    except OperationAborted:
+        raise
+    except Exception:
+        _send_event("file_read", "failed", started=started)
+        raise MediaSendError("file_read") from None
+    _send_event("file_read", "success", started=started)
     upload_options = {"heartbeat": heartbeat}
     if progress is not None:
         upload_options["progress"] = progress
+    if cdn_upload is not None:
+        upload_options["cdn_upload"] = cdn_upload
     download_param, aes_key_b64, cipher_size = upload_media(
         baseurl, token, to_user_id, data, item_type, **upload_options)
     media_ref = {"encrypt_query_param": download_param,
@@ -849,10 +1080,35 @@ def send_media_message(baseurl, token, to_user_id, context_token, file_path,
     # 二次审查 P3-6：同 sendmessage 文本路径，单次尝试（见 ilink 注释）。
     checkpoint(progress, "send_before", 0, 1)
     send_allowed = before_send(0, 1) if before_send is not None else True
-    response = (http_json("POST", baseurl + "/ilink/bot/sendmessage",
-                         auth_headers(token), payload, timeout=60, retries=1)
-                if send_allowed is not False else {"ret": 0, "_locally_accepted": True})
+    started = time.monotonic()
+    try:
+        response = (http_json("POST", baseurl + "/ilink/bot/sendmessage",
+                             auth_headers(token), payload, timeout=60, retries=1)
+                    if send_allowed is not False else {"ret": 0, "_locally_accepted": True})
+    except OperationAborted:
+        raise
+    except Exception:
+        _send_event("sendmessage", "failed", started=started)
+        raise MediaSendError("sendmessage") from None
+    accepted = resp_ok(response)
+    _send_event("sendmessage", "success" if accepted else "failed", performed=send_allowed is not False,
+                started=started)
+    if not accepted:
+        # Preserve token-invalid classification without persisting _raw/errmsg.
+        safe_response = {key: response[key] for key in ("ret", "errcode")
+                         if type(response) is dict and type(response.get(key)) is int}
+        if not safe_response or resp_ok(safe_response):
+            safe_response = {"ret": -1}
+        response = safe_response
     if on_result is not None:
-        on_result(0, 1, response)
+        started = time.monotonic()
+        try:
+            on_result(0, 1, response)
+        except OperationAborted:
+            raise
+        except Exception:
+            _send_event("settle", "failed", started=started)
+            raise MediaSendError("settle") from None
+        _send_event("settle", "success", started=started)
     checkpoint(progress, "send_after", 1, 1)
     return response

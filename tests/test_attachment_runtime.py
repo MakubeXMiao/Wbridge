@@ -62,6 +62,7 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
         self.base = self.home / "bridge"
+        self.base.mkdir(mode=0o700)
         self.store = Store(str(self.base))
         self.addCleanup(self.store.close)
         self.now = time.time()

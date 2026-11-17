@@ -182,17 +182,15 @@ def t_merge_fail_degrades():
     net.send_script = [{"ret": -2, "errmsg": "prepare failed"}]
     flush(store)
     check("合并：失败保留单一批次，不拆开重发", net.send_count() == 1, net.send_count())
-    path = os.path.join(store.pending_dir, "2.json")
-    pending = load_json(path) or {}
-    check("合并：固定正文和发送身份留队", pending.get("text") == "x1\n\nx2"
-          and pending.get("client_key") == "merged:2.json")
-    pending["next_attempt_at"] = 0
-    atomic_write_json(path, pending)
+    failed = load_json(os.path.join(store.failed_dir, "2.json")) or {}
+    check("合并：死信保留固定正文和发送身份", failed.get("text") == "x1\n\nx2"
+          and failed.get("client_key") == "merged:2.json"
+          and failed.get("delivery_outcome") == "unknown")
     flush(store)
-    bodies = net.send_bodies()
-    check("合并：重试复用标识后全组送达", len(bodies) == 2
-          and bodies[0]["msg"]["client_id"] == bodies[1]["msg"]["client_id"]
-          and ls(store.sent_dir) == ["1.json", "2.json"])
+    alias = load_json(os.path.join(store.sent_dir, "1.json")) or {}
+    check("合并：未知批次不重发，成员别名保留覆盖关系", net.send_count() == 1
+          and not ls(store.pending_dir) and ls(store.sent_dir) == ["1.json"]
+          and alias.get("merged_into") == "2.json")
 
 
 def t_fresh_group_defers():
@@ -234,12 +232,13 @@ def t_partial_chunk_collapse():
     write_job(store, "2.json", text="y" * 1500, enqueued_at=now - 29)
     net.send_script = [{"message_id": 1}, {"ret": -2, "errmsg": "x"}]
     flush(store)
-    p = os.path.join(store.pending_dir, "2.json")
-    check("合并：部分送达收拢续发任务", os.path.exists(p))
+    p = os.path.join(store.failed_dir, "2.json")
+    check("合并：部分确认后未知批次进死信", os.path.exists(p))
     if os.path.exists(p):
         j = load_json(p)
-        check("合并：续发任务带 chunks_done=1", j.get("chunks_done") == 1, j)
-        check("合并：续发任务是合并全文",
+        check("合并：死信保留确认分片前缀", j.get("chunks_done") == 1
+              and j.get("delivery_outcome") == "unknown", j)
+        check("合并：死信保留合并全文",
               j.get("text") == "x" * 1500 + "\n\n" + "y" * 1500)
     sent1 = load_json(os.path.join(store.sent_dir, "1.json")) or {}
     check("合并：其余成员标 merged_into 进 sent",
@@ -255,15 +254,13 @@ def t_merge_probe_ok_degrades():
     net.send_script = [{"ret": -14}]
     net.probe_resp = {"ret": 0}
     r = flush(store)
-    check("合并：-14 探活正常保留原批次重试", r is True and net.send_count() == 1
+    check("合并：-14 探活正常时服务继续", r is True and net.send_count() == 1
           and not os.path.exists(store.needs_relogin_path), net.send_count())
-    path = os.path.join(store.pending_dir, "2.json")
-    pending = load_json(path) or {}
-    pending["next_attempt_at"] = 0
-    atomic_write_json(path, pending)
+    failed = load_json(os.path.join(store.failed_dir, "2.json")) or {}
     flush(store)
-    check("合并：-14 重试保持标识且全组送达", len(ls(store.sent_dir)) == 2
-          and net.send_bodies()[0]["msg"]["client_id"] == net.send_bodies()[1]["msg"]["client_id"])
+    check("合并：-14 未知批次保留身份且不重发", net.send_count() == 1
+          and not ls(store.pending_dir) and failed.get("delivery_outcome") == "unknown"
+          and failed.get("client_key") == "merged:2.json")
 
 
 def t_merge_probe_bad():
@@ -275,11 +272,11 @@ def t_merge_probe_bad():
     net.send_script = [{"ret": -14}]
     net.probe_resp = {"ret": -14}
     r = flush(store)
-    check("合并：探活 -14 判失效整组留队", r is False
+    failed = load_json(os.path.join(store.failed_dir, "2.json")) or {}
+    check("合并：探活 -14 判失效并保留未知死信", r is False
           and os.path.exists(store.needs_relogin_path)
-          and ls(store.pending_dir) == ["2.json"]
-          and (load_json(os.path.join(store.pending_dir, "2.json")) or {}).get("merged_from")
-              == ["1.json", "2.json"])
+          and not ls(store.pending_dir) and failed.get("delivery_outcome") == "unknown"
+          and failed.get("merged_from") == ["1.json", "2.json"])
 
 
 def main():

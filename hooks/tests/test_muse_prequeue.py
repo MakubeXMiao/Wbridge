@@ -165,7 +165,7 @@ class MusePrequeueTests(unittest.TestCase):
         self.assertFalse(result["delivery_confirmed"])
         self.assertEqual(count, 1)
         job = load_json(str(Path(self.store.pending_dir) / result["queued"]))
-        self.assertEqual(job["media_path"], str(self.pdf))
+        self.assertTrue(Path(job["media_path"]).samefile(self.pdf))
         self.assertEqual(self.session()["phase"], "queued")
 
     def test_existing_replying_or_uncertain_is_never_reopened(self):

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "account_scope": "codex-pepe-example",
+  "default_backend": "pepe",
+  "job_timeout_seconds": 1800,
+  "approval_timeout_seconds": 300,
+  "backends": {
+    "pepe": {
+      "provider": "pepe",
+      "transport": "http",
+      "instance_id": "pepe-example",
+      "base_url": "http://127.0.0.1:18792",
+      "credential_env": "WBR_PEPE_DOT2API_API_TOKEN",
+      "tenant": "default",
+      "principal": "replace-with-your-api-principal",
+      "queue": "dot",
+      "queue_ownership": "single_store",
+      "instructions": "Reply to payload.messages.",
+      "execution_policy": {
+        "mode": "native_delegate",
+        "approval": "platform_native"
+      }
+    }
+  }
+}

@@ -26,6 +26,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -52,7 +53,7 @@ TIME_FIELDS = ("expires_at", "hard_deadline", "renew_after_seconds")
 # optional V1 transport metadata here instead of importing a new core module.
 MEDIA_DIAGNOSTIC_SOURCES = frozenset(("param", "full_url", "unknown"))
 MEDIA_DIAGNOSTIC_REASONS = frozenset((
-    "ok", "request_or_http_error", "http_body_read_failed", "ciphertext_too_large",
+    "ok", "request_or_http_error", "http_body_read_failed", "http_body_incomplete", "ciphertext_too_large",
     "empty_body", "ciphertext_not_block_aligned", "decrypt_no_candidate",
     "decrypt_ambiguous", "plaintext_too_large", "image_invalid",
     "image_resource_limit", "image_validation_timeout", "write_failed", "unknown",
@@ -62,7 +63,7 @@ MEDIA_DIAGNOSTIC_MAX_SCAN = 32
 MEDIA_DIAGNOSTIC_MAX_BYTES = 4096
 MEDIA_DIAGNOSTIC_MAX_DOWNLOADED = (100 << 20) + 33
 ATTACHMENT_BYTES = 65536
-ATTACHMENT_ACTIONS = frozenset(("query", "get", "reference", "release", "pin", "label", "cancel",
+ATTACHMENT_ACTIONS = frozenset(("query", "get", "reference", "reference_v2", "release", "pin", "label", "cancel",
                                 "reply", "continue", "status"))
 ATTACHMENT_ERRORS = frozenset((
     "unsupported_version", "unsupported_action", "invalid_request", "response_too_large",
@@ -80,6 +81,29 @@ TAG_SOURCES = frozenset(("user", "batch_text", "original_name", "inferred"))
 CAPABILITY_FEATURES = ("attachments_v1", "references_v1", "attachment_groups_v1")
 LABEL_FEATURE = "attachment_labels_v1"
 CANCEL_FEATURE = "attachment_cancel_v1"
+REFERENCE_V2_FEATURE = "references_v2"
+PHOTO_STATES = frozenset(("confirmed_photo", "not_photo", "unverified"))
+REFERENCE_V2_IDENTITY_FIELDS = ("schema_version", "snapshot_id", "text_message_id", "cutoff_seq",
+                                "group_id", "login_epoch", "created_at", "expires_at",
+                                "first_event_seq", "last_member_seq", "membership_digest",
+                                "position_limit", "attachment_count", "candidate_position_count",
+                                "overflow")
+REFERENCE_V2_SLOT_IDENTITY_FIELDS = ("ordinal", "message_id", "item_index", "attachment_id",
+                                     "received_at", "event_seq", "kind")
+CONTEXT_FEATURES = ("recent_context_v1", "memory_delta_v1", "cloud_context_v1")
+CONTEXT_REASONS = frozenset(("disabled", "context_unavailable", "storage_busy", "storage_invalid",
+    "sequence_unavailable", "scope_mismatch", "epoch_mismatch", "clock_invalid", "too_large",
+    "invalid_request", "publisher_mismatch", "binding_mismatch", "revision_conflict", "older_source",
+    "source_missing", "source_invalid", "source_expired", "source_revoked", "source_paused",
+    "source_unavailable", "cache_missing", "storage_changed", "storage_too_large", "source_too_large",
+    "cache_too_large", "cleaned", "unchanged", "applied", "published", "clock_anomaly",
+    "projection_too_large", "entry_unavailable", "invalid_entry", "entry_too_large", "scope_unavailable"))
+SYNTHETIC_CLOUD_BINDING = {"source_id": "wbridge-synthetic", "case_id": "continuity-smoke",
+                           "publisher_id": "wbridge-synthetic-publisher"}
+RUNTIME_SWITCH_NAMES = ("WECHAT_REFERENCE_V2", "WECHAT_CDN_TIER_TRIAL",
+                        "WECHAT_RECENT_CONTEXT", "WECHAT_CLOUD_CONTEXT")
+RUNTIME_SWITCH_FILE = "runtime-switches.json"
+RUNTIME_SWITCH_BYTES = 4096
 CAPABILITY_LIMITS = {"request_bytes": ATTACHMENT_BYTES, "response_bytes": ATTACHMENT_BYTES,
                      "query_limit": 20, "attachment_ids": 16, "reference_ordinals": 16}
 
@@ -131,16 +155,19 @@ def validate_request(request):
     if not isinstance(request, dict):
         raise InvalidRequest()
     action = request.get("action")
-    if action not in ("begin", "refresh", "reply", "release", "attachment"):
+    if action not in ("begin", "refresh", "reply", "release", "attachment", "context_quote"):
         raise InvalidRequest()
     required = {"action", "lease"} if action == "begin" else {"action", "handle"}
     allowed = set(required)
     if action == "reply":
         required.add("revision")
-        allowed.update(("revision", "text", "media_path"))
+        allowed.update(("revision", "text", "media_path", "memory_delta_v1"))
     if action == "attachment":
         required.update(("revision", "request"))
-        allowed.update(("revision", "request"))
+        allowed.update(("revision", "request", "memory_delta_v1"))
+    if action == "context_quote":
+        required.update(("revision", "entry_id", "quote_index"))
+        allowed.update(("revision", "entry_id", "quote_index"))
     if not required.issubset(request) or set(request) - allowed:
         raise InvalidRequest()
     if action == "begin":
@@ -148,7 +175,7 @@ def validate_request(request):
             raise InvalidRequest()
     elif not isinstance(request["handle"], str) or not HANDLE_RE.fullmatch(request["handle"]):
         raise InvalidRequest()
-    if action in ("reply", "attachment"):
+    if action in ("reply", "attachment", "context_quote"):
         revision = request["revision"]
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
             raise InvalidRequest()
@@ -158,6 +185,12 @@ def validate_request(request):
             _attachment_size(request)
         except (SessionError, ValueError, TypeError, RecursionError):
             raise InvalidRequest() from None
+        if "memory_delta_v1" in request and request["request"]["action"] not in ("reply", "continue"):
+            raise InvalidRequest()
+    if action == "context_quote":
+        if (type(request["entry_id"]) is not str or re.fullmatch(r"[0-9a-f]{64}", request["entry_id"]) is None
+                or type(request["quote_index"]) is not int or not 0 <= request["quote_index"] < 3):
+            raise InvalidRequest()
     if action == "reply":
         text = request.get("text", "")
         media = request.get("media_path")
@@ -181,6 +214,13 @@ def _fields(value, names):
     if type(value) is not dict or any(name not in value for name in names):
         raise SessionError("invalid_state_result")
     return {name: value[name] for name in names}
+
+
+def _exact_fields(value, names):
+    result = _fields(value, names)
+    if len(value) != len(result):
+        raise SessionError("invalid_state_result")
+    return result
 
 
 def _string(value, nullable=False, chars=ATTACHMENT_BYTES, nonempty=True, byte_limit=ATTACHMENT_BYTES):
@@ -225,8 +265,8 @@ def _ids(value, limit=16, minimum=0):
     return result
 
 
-def _version(value):
-    if type(value) is not int or value != 1:
+def _version(value, expected=1):
+    if type(value) is not int or value != expected:
         raise SessionError("unsupported_version")
     return value
 
@@ -241,7 +281,7 @@ def _capabilities(value):
     if not set(CAPABILITY_FEATURES).issubset(features):
         raise SessionError("attachment_unavailable")
     result["features"] = list(CAPABILITY_FEATURES)
-    for feature in (LABEL_FEATURE, CANCEL_FEATURE):
+    for feature in (LABEL_FEATURE, CANCEL_FEATURE, REFERENCE_V2_FEATURE):
         if feature in features:
             result["features"].append(feature)
     result["limits"] = _fields(result["limits"], CAPABILITY_LIMITS)
@@ -272,11 +312,13 @@ def _attachment_request(value):
     if action not in ATTACHMENT_ACTIONS or type(result["arguments"]) is not dict:
         raise SessionError("invalid_request")
     required = {"get": {"attachment_id"}, "reference": {"text_message_id", "snapshot_id"},
+                "reference_v2": {"text_message_id", "snapshot_id"},
                 "release": {"hold_id"}, "pin": {"attachment_id", "pinned"},
                 "label": {"text_message_id", "label"},
                 "cancel": {"text_message_id", "group_id"},
                 "reply": {"attachment_ids"}, "continue": {"group_id"}}.get(action, set())
     optional = {"query": {"filters", "cursor", "limit"}, "reference": {"ordinals"},
+                "reference_v2": {"ordinals"},
                 "label": {"snapshot_id", "ordinals", "attachment_ids"},
                 "reply": {"caption"}, "status": {"group_id", "cursor", "limit"}}.get(action, set())
     args = result["arguments"]
@@ -374,6 +416,80 @@ def _reference_identity(value):
     result["slots"] = [{key: item[key] for key in ("ordinal", "message_id", "item_index", "attachment_id")}
                        for item in value["slots"]]
     return result
+
+
+def _reference_v2_slot(value):
+    slot = _exact_fields(value, REFERENCE_V2_SLOT_IDENTITY_FIELDS + ("status", "photo_state"))
+    for key in ("message_id", "attachment_id", "kind", "status", "photo_state"):
+        _string(slot[key])
+    _integer(slot["ordinal"], 1)
+    _integer(slot["item_index"])
+    _integer(slot["event_seq"], 1)
+    _number(slot["received_at"])
+    if (slot["kind"] not in ("image", "file") or slot["status"] not in SLOT_STATES
+            or slot["photo_state"] not in PHOTO_STATES):
+        raise SessionError("invalid_state_result")
+    return slot
+
+
+def _reference_v2_context(value, message_id):
+    if value is None:
+        return None
+    context = _exact_fields(value, REFERENCE_V2_IDENTITY_FIELDS +
+                            ("confirmed_photo_count", "slots", "latest_candidate"))
+    _version(context["schema_version"], 2)
+    for key in ("snapshot_id", "text_message_id", "group_id", "login_epoch", "membership_digest"):
+        _string(context[key])
+    if (context["text_message_id"] != message_id
+            or not re.fullmatch(r"[0-9a-f]{64}", context["membership_digest"])):
+        raise SessionError("invalid_state_result")
+    first = _integer(context["first_event_seq"], 1)
+    last = _integer(context["last_member_seq"], first)
+    _integer(context["cutoff_seq"], last)
+    if _number(context["expires_at"]) < _number(context["created_at"]):
+        raise SessionError("invalid_state_result")
+    limit = _integer(context["position_limit"], 1, 16)
+    attachments = _integer(context["attachment_count"])
+    candidates = _integer(context["candidate_position_count"], 0, attachments)
+    confirmed = _integer(context["confirmed_photo_count"], 0, candidates)
+    shown = min(limit, candidates)
+    if _boolean(context["overflow"]) != (candidates > limit):
+        raise SessionError("invalid_state_result")
+    slots = context["slots"] = _list(context["slots"], shown, _reference_v2_slot, shown)
+    latest = context["latest_candidate"]
+    if latest is not None:
+        latest = context["latest_candidate"] = _reference_v2_slot(latest)
+    visible = slots + ([latest] if latest is not None and latest["ordinal"] > shown else [])
+    order = [(slot["event_seq"], slot["item_index"]) for slot in visible]
+    if ([slot["ordinal"] for slot in slots] != list(range(1, shown + 1))
+            or order != sorted(set(order))
+            or any(not first <= slot["event_seq"] <= last for slot in visible)
+            or len({slot["attachment_id"] for slot in visible}) != len(visible)):
+        raise SessionError("invalid_state_result")
+    if latest is not None:
+        ordinal = latest["ordinal"]
+        if (ordinal > candidates or latest["photo_state"] == "not_photo"
+                or ordinal <= shown and latest != slots[ordinal - 1]):
+            raise SessionError("invalid_state_result")
+    eligible = [slot for slot in visible if slot["photo_state"] != "not_photo"]
+    if (eligible[-1] if eligible else None) != latest:
+        raise SessionError("invalid_state_result")
+    known_photos = sum(slot["photo_state"] == "confirmed_photo" for slot in visible)
+    last_eligible = latest["ordinal"] if latest is not None else 0
+    possible_hidden = max(0, last_eligible - len(visible))
+    if not known_photos <= confirmed <= known_photos + possible_hidden:
+        raise SessionError("invalid_state_result")
+    return context
+
+
+def _reference_v2_binding(context):
+    if context is None:
+        return None
+    identity = {key: context[key] for key in REFERENCE_V2_IDENTITY_FIELDS}
+    identity["slots"] = [{key: slot[key] for key in REFERENCE_V2_SLOT_IDENTITY_FIELDS}
+                         for slot in context["slots"]]
+    return {"snapshot_id": context["snapshot_id"], "slot_count": len(context["slots"]),
+            "digest": _digest(identity)}
 
 
 def _digest(value):
@@ -500,30 +616,49 @@ def _attachment_result(value, request, session, base):
         if (clean["attachment"]["status"] != "ready" or clean["attachment"]["attachment_id"] != args["attachment_id"]
                 or clean["material"]["attachment_id"] != args["attachment_id"]):
             raise SessionError("invalid_state_result")
-    elif action == "reference":
-        clean = _fields(raw, ("reference_context", "materials", "unavailable", "complete"))
-        clean["reference_context"] = _reference_context(clean["reference_context"], args["text_message_id"])
-        context = clean["reference_context"]
-        if (context is None or context["snapshot_id"] != args["snapshot_id"] or
-                session.get("reference_digests", {}).get(args["text_message_id"]) != _digest(_reference_identity(context))):
+    elif action in ("reference", "reference_v2"):
+        is_v2 = action == "reference_v2"
+        context_key = "reference_context_v2" if is_v2 else "reference_context"
+        project = _exact_fields if is_v2 else _fields
+        clean = project(raw, (context_key, "materials", "unavailable", "complete"))
+        parse = _reference_v2_context if is_v2 else _reference_context
+        mid = args["text_message_id"]
+        context = clean[context_key] = parse(clean[context_key], mid)
+        if context is None or context["snapshot_id"] != args["snapshot_id"]:
+            raise SessionError("invalid_state_result")
+        if is_v2:
+            matches = session.get("reference_bindings_v2", {}).get(mid) == _reference_v2_binding(context)
+        else:
+            matches = session.get("reference_digests", {}).get(mid) == _digest(_reference_identity(context))
+        if not matches:
             raise SessionError("invalid_state_result")
         clean["materials"] = _list(clean["materials"], 16, lambda item: _material(item, base, True))
         def unavailable(item):
-            item = _fields(item, ("ordinal", "attachment_id", "status"))
+            keys = ("ordinal", "attachment_id", "status")
+            item = project(item, keys + ("photo_state",) if is_v2 else keys)
             _integer(item["ordinal"], 1, 16)
             _string(item["attachment_id"])
             if type(item["status"]) is not str or item["status"] not in SLOT_STATES:
                 raise SessionError("invalid_state_result")
+            if is_v2 and _string(item["photo_state"]) not in PHOTO_STATES:
+                raise SessionError("invalid_state_result")
             return item
         clean["unavailable"] = _list(clean["unavailable"], 16, unavailable)
         _boolean(clean["complete"])
-        selected = args.get("ordinals", [item["ordinal"] for item in context["slots"]])
+        default_selection = [] if is_v2 else [item["ordinal"] for item in context["slots"]]
+        selected = args.get("ordinals", default_selection)
         slots = {item["ordinal"]: item for item in context["slots"]}
         returned = clean["materials"] + clean["unavailable"]
         if (len(returned) != len(selected) or {item["ordinal"] for item in returned} != set(selected) or
                 any(slots.get(item["ordinal"], {}).get("attachment_id") != item["attachment_id"] for item in returned) or
                 any(slots[item["ordinal"]]["status"] != "ready" for item in clean["materials"]) or
                 clean["complete"] != (not clean["unavailable"])):
+            raise SessionError("invalid_state_result")
+        if is_v2 and (
+                any(slots[item["ordinal"]]["photo_state"] != "confirmed_photo" for item in clean["materials"])
+                or any((item["status"] == "ready" and item["photo_state"] == "confirmed_photo")
+                       or any(slots[item["ordinal"]][key] != item[key] for key in ("status", "photo_state"))
+                       for item in clean["unavailable"])):
             raise SessionError("invalid_state_result")
     elif action == "release":
         clean = _fields(raw, ("released",))
@@ -574,6 +709,85 @@ def _trusted_paths(base, state_dir):
             or not Path(base).is_absolute() or not Path(state_dir).is_absolute()):
         raise SessionError("invalid_configuration")
     return str(Path(base).resolve()), str(Path(state_dir).resolve())
+
+
+def _runtime_environment(state_dir):
+    """Read only the trusted launch configuration, never a model request."""
+    directory = Path(state_dir) / "muse-adapter"
+    directory_fd = config_fd = None
+    try:
+        if not Path(state_dir).is_absolute():
+            raise ValueError()
+        try:
+            directory_fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        try:
+            config_fd = os.open(RUNTIME_SWITCH_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None
+        parent = os.fstat(directory_fd)
+        before = os.fstat(config_fd)
+        if (parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) != 0o700
+                or not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                or before.st_size > RUNTIME_SWITCH_BYTES):
+            raise ValueError()
+        raw = os.read(config_fd, RUNTIME_SWITCH_BYTES + 1)
+        after = os.fstat(config_fd)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size,
+                                 info.st_mtime_ns, info.st_ctime_ns)
+        current = os.stat(RUNTIME_SWITCH_FILE, dir_fd=directory_fd, follow_symlinks=False)
+        current_parent = directory.lstat()
+        if (len(raw) > RUNTIME_SWITCH_BYTES or len(raw) != before.st_size
+                or identity(before) != identity(after) or identity(after) != identity(current)
+                or not os.path.samestat(parent, current_parent)
+                or stat.S_IMODE(current_parent.st_mode) != 0o700):
+            raise ValueError()
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
+                           parse_constant=_reject_constant)
+        if (type(value) is not dict or set(value) != {"schema_version", "environment"}
+                or type(value["schema_version"]) is not int or value["schema_version"] != 1
+                or type(value["environment"]) is not dict
+                or set(value["environment"]) != set(RUNTIME_SWITCH_NAMES)):
+            raise ValueError()
+        env = value["environment"]
+        if any(type(env[name]) is not str or env[name] not in ("0", "1") for name in RUNTIME_SWITCH_NAMES):
+            raise ValueError()
+        return {name: env[name] for name in RUNTIME_SWITCH_NAMES}
+    except Exception:
+        raise SessionError("invalid_configuration") from None
+    finally:
+        if config_fd is not None:
+            os.close(config_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+@contextmanager
+def _runtime_switches(environment):
+    # CLI entry only. Each platform adapter invocation is its own process;
+    # embedded callers get their original environment back on every outcome.
+    previous = {name: os.environ.get(name) for name in environment}
+    try:
+        os.environ.update(environment)
+        if environment:
+            try:
+                effective = {name: os.environ[name] for name in RUNTIME_SWITCH_NAMES}
+                print("runtime_configuration " + json.dumps({
+                    "stage": "muse_runtime_configuration", "pid": os.getpid(),
+                    "effective_switches_sha256": _digest(effective),
+                    "effective_switches": effective}, separators=(",", ":")), file=sys.stderr)
+            except Exception:
+                pass
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _adapter_dir(state_dir):
@@ -666,16 +880,16 @@ def _emit_safe_traces(raw, stream):
             continue
 
 
-def _invoke(method, *args):
+def _invoke(method, *args, **kwargs):
     errors, original_stderr = io.StringIO(), sys.stderr
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(errors):
-            return method(*args)
+            return method(*args, **kwargs)
     finally:
         _emit_safe_traces(errors.getvalue(), original_stderr)
 
 
-def _invoke_timed(session, action, method, *args):
+def _invoke_timed(session, action, method, *args, **kwargs):
     # Private adapter call times only: these are not inferred from lease
     # deadlines and do not establish platform wakeup or message delivery time.
     timing = {"started_at": None, "returned_at": None,
@@ -684,7 +898,7 @@ def _invoke_timed(session, action, method, *args):
     def call():
         timing["started_at"] = time.time()
         try:
-            result = method(*args)
+            result = method(*args, **kwargs)
         except Exception:
             timing["returned_at"] = time.time()
             raise
@@ -746,7 +960,9 @@ def _snapshot(session, batch):
             or [message.get("message_id") for message in messages] != owned):
         raise SessionError("invalid_state_result")
     caps = _capabilities(batch["capabilities"]) if "capabilities" in batch else None
-    clean, reference_digests = [], {}
+    clean, reference_digests, reference_bindings_v2 = [], {}, {}
+    old_owned = set(session.get("owned", []))
+    old_v2 = session.get("reference_bindings_v2", {})
     for message in messages:
         if ("text" in message and not isinstance(message["text"], str)
                 or "media_paths" in message and
@@ -785,6 +1001,16 @@ def _snapshot(session, batch):
                 raise SessionError("invalid_state_result")
         elif "attachment_refs" in message or "reference_context" in message:
             raise SessionError("attachment_unavailable")
+        mid = item["message_id"]
+        has_v2 = "reference_context_v2" in message
+        if has_v2:
+            if caps is None or REFERENCE_V2_FEATURE not in caps["features"]:
+                raise SessionError("attachment_unavailable")
+            context = item["reference_context_v2"] = _reference_v2_context(message["reference_context_v2"], mid)
+            reference_bindings_v2[mid] = _reference_v2_binding(context)
+        if mid in old_owned and (has_v2 != (mid in old_v2)
+                                 or old_v2.get(mid) != reference_bindings_v2.get(mid)):
+            raise SessionError("invalid_state_result")
         clean.append(item)
     fields = dict(messages=clean, owned_count=len(owned), revision=session.get("revision", 0) + 1)
     if caps is not None:
@@ -801,11 +1027,14 @@ def _snapshot(session, batch):
             digest_item["reference_context"] = _reference_identity(item["reference_context"])
             digest_item["attachment_refs"] = [{key: ref[key] for key in ("attachment_id", "item_index", "kind")}
                                                for ref in item["attachment_refs"]]
+        if "reference_context_v2" in item:
+            digest_item["reference_context_v2"] = reference_bindings_v2[item["message_id"]]
         digest_messages.append(digest_item)
     session["batch_digest"] = _digest(digest_messages)
     session["capabilities"] = caps
     # Hashes bind the current batch's immutable references, not a history cache.
     session["reference_digests"] = reference_digests
+    session["reference_bindings_v2"] = reference_bindings_v2
     for key in TIME_FIELDS:
         value = batch.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -851,6 +1080,272 @@ def _legacy_media_preflight(request, handle, session, state):
     return None
 
 
+def _context_capabilities():
+    try:
+        from wechat_bridge.context_runtime import capabilities
+        raw = _invoke(capabilities)
+        _version(raw["schema_version"])
+        features = _ids(raw["features"], len(CONTEXT_FEATURES), minimum=0)
+        return {"schema_version": 1, "features": [name for name in CONTEXT_FEATURES if name in features]}
+    except Exception:
+        return None
+
+
+def _context_hex(value):
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise SessionError("invalid_state_result")
+    return value
+
+
+def _context_time(value):
+    if _number(value) < 0:
+        raise SessionError("invalid_state_result")
+    return value
+
+
+def _context_limit(value, limit):
+    if len(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")) > limit:
+        raise SessionError("invalid_state_result")
+    return value
+
+
+def _context_ref(value):
+    clean = _fields(value, ("entry_id", "expires_at"))
+    _context_hex(clean["entry_id"])
+    _context_time(clean["expires_at"])
+    return clean
+
+
+def _context_source(value):
+    clean = _fields(value, ("message_id", "seq", "received_at", "fingerprint"))
+    _string(clean["message_id"], chars=180)
+    if safe_message_id(clean["message_id"]) != clean["message_id"]:
+        raise SessionError("invalid_state_result")
+    _integer(clean["seq"], low=1)
+    _context_time(clean["received_at"])
+    _context_hex(clean["fingerprint"])
+    return clean
+
+
+def _context_entry(value):
+    clean = _fields(value, ("schema_version", "id", "revision", "topic", "intent", "bot_action",
+                            "open_loop", "sources", "source_at", "expires_at", "cutoff_seq",
+                            "historical_refs", "admission", "quote_count"))
+    _version(clean["schema_version"])
+    _context_hex(clean["id"])
+    _integer(clean["revision"], low=1)
+    for name, maximum in (("topic", 48), ("intent", 80), ("bot_action", 128), ("open_loop", 128)):
+        _string(clean[name], chars=maximum, nonempty=False)
+    if sum(len(clean[name]) for name in ("topic", "intent", "bot_action", "open_loop")) > 256:
+        raise SessionError("invalid_state_result")
+    clean["sources"] = _list(clean["sources"], 1000, _context_source, minimum=1)
+    if (len({row["message_id"] for row in clean["sources"]}) != len(clean["sources"])
+            or len({row["seq"] for row in clean["sources"]}) != len(clean["sources"])):
+        raise SessionError("invalid_state_result")
+    clean["historical_refs"] = _list(clean["historical_refs"], 10, _context_ref)
+    _context_time(clean["source_at"])
+    _context_time(clean["expires_at"])
+    _integer(clean["cutoff_seq"], low=1)
+    _integer(clean["quote_count"], high=3)
+    admission = clean["admission"] = _fields(clean["admission"], ("kind", "job_id", "group_id"))
+    if admission["kind"] not in ("reply", "attachment"):
+        raise SessionError("invalid_state_result")
+    _string(admission["job_id"], chars=512)
+    _string(admission["group_id"], chars=512, nullable=True)
+    if (clean["source_at"] != min(row["received_at"] for row in clean["sources"])
+            or clean["expires_at"] != clean["source_at"] + 48 * 3600
+            or clean["cutoff_seq"] != max(row["seq"] for row in clean["sources"])):
+        raise SessionError("invalid_state_result")
+    return _context_limit(clean, 8 << 10)
+
+
+def _context_recent(value):
+    clean = _fields(value, ("schema_version", "snapshot_id", "entries", "high_water_seq"))
+    _version(clean["schema_version"])
+    _context_hex(clean["snapshot_id"])
+    _integer(clean["high_water_seq"])
+    clean["entries"] = _list(clean["entries"], 10, _context_entry)
+    if len({row["id"] for row in clean["entries"]}) != len(clean["entries"]):
+        raise SessionError("invalid_state_result")
+    if any(row["cutoff_seq"] > clean["high_water_seq"] for row in clean["entries"]):
+        raise SessionError("invalid_state_result")
+    return _context_limit(clean, 12 << 10)
+
+
+def _context_reason(value):
+    return value if type(value) is str and value in CONTEXT_REASONS else "context_unavailable"
+
+
+def _context_cloud(value):
+    clean = _fields(value, ("schema_version", "status", "projection"))
+    _version(clean["schema_version"])
+    if clean["status"] not in ("disabled", "empty", "available", "unavailable", "update_pending", "paused", "expired", "skipped"):
+        raise SessionError("invalid_state_result")
+    if "reason" in value:
+        clean["reason"] = _context_reason(value["reason"])
+    if clean["status"] in ("disabled", "paused", "expired") and clean["projection"] is not None:
+        raise SessionError("invalid_state_result")
+    if clean["projection"] is not None:
+        fields = ("source_id", "case_id", "publisher_id", "source_revision", "source_updated_at", "source_ref",
+                  "fact_status", "title", "facts", "change", "next_step", "open_loop", "source_digest",
+                  "bridge_checked_at", "bridge_applied_at", "observed_source_revision")
+        card = clean["projection"] = _fields(clean["projection"], fields)
+        for name in ("source_id", "case_id", "publisher_id"):
+            _string(card[name], chars=128)
+        _string(card["source_ref"], chars=512)
+        for name in ("title", "facts", "change", "next_step", "open_loop"):
+            _string(card[name], chars=512, nonempty=False)
+        if sum(len(card[name]) for name in ("title", "facts", "change", "next_step", "open_loop")) > 512:
+            raise SessionError("invalid_state_result")
+        if card["fact_status"] not in ("confirmed", "provisional", "corrected", "completed", "revoked"):
+            raise SessionError("invalid_state_result")
+        _context_hex(card["source_digest"])
+        _integer(card["source_revision"], low=1)
+        if card["observed_source_revision"] is not None:
+            _integer(card["observed_source_revision"], low=1)
+        for name in ("source_updated_at", "bridge_checked_at", "bridge_applied_at"):
+            _context_time(card[name])
+    return _context_limit(clean, 4 << 10)
+
+
+def _context_projection(value, caps):
+    if type(value) is not dict:
+        raise SessionError("invalid_state_result")
+    clean = {}
+    for key, limit, convert in (("recent_context_v1", 12 << 10, _context_recent),
+                                ("cloud_context_v1", 4 << 10, _context_cloud)):
+        if key in caps["features"] and key in value:
+            try:
+                clean[key] = _context_limit(convert(value[key]), limit)
+            except Exception:
+                clean["context_status"] = "context_unavailable"
+    for key in ("context_status", "recent_context_status"):
+        if key in value:
+            clean[key] = _context_reason(value[key])
+    return _context_limit(clean, 16 << 10)
+
+
+def _context_basis(value):
+    if value is None:
+        return None
+    clean = _exact_fields(value, ("payload", "signature"))
+    _context_hex(clean["signature"])
+    body = clean["payload"] = _exact_fields(clean["payload"],
+        ("schema_version", "scope", "snapshot_id", "issued_at", "entries"))
+    _version(body["schema_version"])
+    _context_hex(body["snapshot_id"])
+    _context_time(body["issued_at"])
+    scope = body["scope"] = _exact_fields(body["scope"],
+        ("bot_id", "owner_id", "conversation_id", "login_epoch"))
+    for value in scope.values():
+        _string(value, chars=512)
+    body["entries"] = _list(body["entries"], 10, _context_ref)
+    return _context_limit(clean, 16 << 10)
+
+
+def _context_trace(stage, started, outcome, projection=None):
+    try:
+        record = {"stage": stage, "result": outcome,
+                  "elapsed_ms": round((time.perf_counter() - started) * 1000, 3)}
+        if projection is not None:
+            record["projection_bytes"] = len(json.dumps(projection, ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        print("latency " + json.dumps(record), file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _context_read(state, batch, session):
+    # This view never participates in batch/revision or image identity.
+    session.pop("context_basis", None)
+    session.pop("context_capabilities", None)
+    caps = _context_capabilities()
+    if caps is not None and session.get("context_cloud_binding") is None:
+        caps = dict(caps, features=[name for name in caps["features"] if name != "cloud_context_v1"])
+    if not caps or not caps["features"] or not callable(getattr(state, "context_for_batch", None)):
+        return {}
+    session["context_capabilities"] = caps
+    started = None
+    try:
+        started = time.perf_counter()
+        binding = session.get("context_cloud_binding")
+        if binding is None:
+            view = _invoke(state.context_for_batch, batch)
+        else:
+            from wechat_bridge.cloud_context import CloudBinding
+            view = _invoke(state.context_for_batch, batch, CloudBinding(**binding))
+        projection = _context_projection(view.projection, caps)
+        session["context_basis"] = _context_basis(view.basis)
+    except Exception:
+        projection = {"context_status": "context_unavailable"}
+    _context_trace("context_read", started, "returned", projection)
+    return {"context_capabilities": caps, "context": projection}
+
+
+def _context_quote(request, handle, session, state):
+    result = {"status": "unavailable", "reason": "context_unavailable"}
+    try:
+        caps = session.get("context_capabilities") or {}
+        if "recent_context_v1" not in caps.get("features", ()) or not session.get("context_basis"):
+            return dict(ok=True, handle=handle, revision=session["revision"], result=result)
+        visible = {row["entry_id"]: row["expires_at"]
+                   for row in session["context_basis"]["payload"]["entries"]}
+        if request["entry_id"] not in visible:
+            return dict(ok=True, handle=handle, revision=session["revision"], result=result)
+        batch = {"lease": session["lease"], "owned": list(session["owned"])}
+        raw = _invoke(state.context_quote, batch, session["context_basis"], request["entry_id"], request["quote_index"])
+        if type(raw) is dict and raw.get("status") == "unavailable":
+            result["reason"] = _context_reason(raw.get("reason"))
+        elif type(raw) is dict and raw.get("status") == "ok":
+            clean = _fields(raw, ("status", "entry_id", "expires_at", "quote"))
+            if _context_hex(clean["entry_id"]) != request["entry_id"]:
+                raise SessionError("invalid_state_result")
+            if _context_time(clean["expires_at"]) != visible[request["entry_id"]]:
+                raise SessionError("invalid_state_result")
+            quote = clean["quote"] = _fields(clean["quote"], ("speaker", "message_id", "text", "truncated"))
+            if quote["speaker"] not in ("user", "bot"):
+                raise SessionError("invalid_state_result")
+            _string(quote["message_id"], chars=180)
+            if safe_message_id(quote["message_id"]) != quote["message_id"]:
+                raise SessionError("invalid_state_result")
+            _string(quote["text"], chars=2048, byte_limit=2048, nonempty=False)
+            _boolean(quote["truncated"])
+            result = _context_limit(clean, 4096)
+    except Exception:
+        pass
+    return dict(ok=True, handle=handle, revision=session["revision"], result=result)
+
+
+def _context_terminal(session, state, request, method_name):
+    """Negotiate before publication. A failed wrapper is never retried."""
+    caps = session.get("context_capabilities")
+    if ("memory_delta_v1" not in request or type(caps) is not dict
+            or "memory_delta_v1" not in caps.get("features", ())):
+        return None
+    method = getattr(state, method_name, None)
+    return method if callable(method) else None
+
+
+def _context_commit(state, wrapped, request):
+    """Called only after the original queued state has been durably saved."""
+    if wrapped is None:
+        return
+    started = None
+    outcome = "skipped"
+    try:
+        started = time.perf_counter()
+        capsule = wrapped.context_capsule
+        if capsule is not None:
+            result = _invoke(state.context_commit, capsule, request.get("memory_delta_v1"))
+            outcome = result.get("status") if type(result) is dict else None
+            if outcome not in ("applied", "skipped"):
+                outcome = "unavailable"
+    except Exception:
+        outcome = "unavailable"
+    _context_trace("context_commit", started, outcome)
+
+
 def _dispatch_attachment(request, directory, handle, session, state, base):
     wire = _attachment_request(request["request"])
     action = wire["action"]
@@ -868,6 +1363,16 @@ def _dispatch_attachment(request, directory, handle, session, state, base):
     if action == "reference" and (wire["arguments"]["text_message_id"] not in session["owned"] or
                                    not session.get("reference_digests", {}).get(wire["arguments"]["text_message_id"])):
         return _attachment_failure(handle, session, "attachment_unavailable")
+    if action == "reference_v2":
+        args = wire["arguments"]
+        mid = args["text_message_id"]
+        binding = session.get("reference_bindings_v2", {}).get(mid)
+        if (REFERENCE_V2_FEATURE not in session["capabilities"]["features"]
+                or mid not in session["owned"] or binding is None):
+            return _attachment_failure(handle, session, "attachment_unavailable")
+        if (args["snapshot_id"] != binding["snapshot_id"]
+                or any(ordinal > binding["slot_count"] for ordinal in args.get("ordinals", []))):
+            return _attachment_failure(handle, session, "invalid_request")
     publishing = action in ("reply", "continue")
     timing_key = "reply" if publishing else "attachment_" + action
     if publishing:
@@ -876,8 +1381,17 @@ def _dispatch_attachment(request, directory, handle, session, state, base):
             "started_at": None, "returned_at": None, "result": "outcome_unknown"}
         _save(directory, handle, session)
     try:
-        raw = _invoke_timed(session, timing_key, state.attachment_call,
-                            list(session["owned"]), session["lease"], wire)
+        wrapped = None
+        method = _context_terminal(session, state, request, "attachment_call_with_context") if publishing else None
+        if method is None:
+            raw = _invoke_timed(session, timing_key, state.attachment_call,
+                                list(session["owned"]), session["lease"], wire)
+        else:
+            wrapped = _invoke_timed(session, timing_key, method,
+                                    list(session["owned"]), session["lease"], wire,
+                                    handle=handle, revision=session["revision"],
+                                    basis=session.get("context_basis"))
+            raw = wrapped.result
         envelope = _attachment_result(raw, wire, session, base)
         if not envelope["ok"]:
             error = envelope["error"]
@@ -888,6 +1402,8 @@ def _dispatch_attachment(request, directory, handle, session, state, base):
                 return _attachment_failure(handle, session, "outcome_unknown")
             session["phase"] = ("needs_refresh" if code == "needs_refresh" else
                                 "lease_lost" if code in ("lease_lost", "epoch_mismatch") else "active")
+            if code == "needs_refresh":
+                session.pop("context_basis", None)
             session["call_timings"][timing_key]["result"] = code
             _save(directory, handle, session)
             return _attachment_failure(handle, session, code, error["retryable"])
@@ -896,6 +1412,8 @@ def _dispatch_attachment(request, directory, handle, session, state, base):
         session["phase"] = "queued" if publishing else "active"
         session["call_timings"][timing_key]["result"] = "queued" if publishing else "ok"
         _save(directory, handle, session)
+        if publishing:
+            _context_commit(state, wrapped, request)
         return response
     except Exception:
         if publishing:
@@ -906,7 +1424,7 @@ def _dispatch_attachment(request, directory, handle, session, state, base):
         return _attachment_failure(handle, session, "storage_invalid")
 
 
-def _dispatch(request, base, state_dir, state_factory):
+def _dispatch(request, base, state_dir, state_factory, cloud_binding=None):
     action = request["action"]
     directory = _adapter_dir(state_dir)
     handle = uuid.uuid4().hex if action == "begin" else request["handle"]
@@ -915,17 +1433,22 @@ def _dispatch(request, base, state_dir, state_factory):
             state = state_factory(base, state_dir)
             session = {"schema": SCHEMA, "base": base, "state_dir": state_dir,
                        "phase": "active"}
+            if cloud_binding is not None:
+                session["context_cloud_binding"] = dict(cloud_binding)
             batch = _invoke_timed(session, "begin", state.begin, request["lease"])
             if not batch.get("owned"):
                 return failure("lease_lost")
             session["lease"] = batch["lease"]
             fields = _snapshot(session, batch)
+            fields.update(_context_read(state, batch, session))
             session["call_timings"]["begin"]["result"] = "ok"
             _save(directory, handle, session)
             response = dict(ok=True, handle=handle, **fields)
             return response
 
         session = _load(directory, handle, base, state_dir)
+        if cloud_binding is not None and session.get("context_cloud_binding") != cloud_binding:
+            raise SessionError("invalid_configuration")
         phase = session.get("phase")
         if phase in ("replying", "uncertain", "releasing"):
             if action == "attachment":
@@ -939,15 +1462,17 @@ def _dispatch(request, base, state_dir, state_factory):
             if action == "attachment":
                 return _attachment_failure(handle, session, "session_closed")
             return failure("session_closed")
-        if action in ("reply", "attachment") and request["revision"] != session["revision"]:
+        if action in ("reply", "attachment", "context_quote") and request["revision"] != session["revision"]:
             if action == "attachment":
                 return _attachment_failure(handle, session, "revision_mismatch")
             return failure("revision_mismatch", revision=session["revision"], requires_refresh=True)
-        if action in ("reply", "attachment") and phase == "needs_refresh":
+        if action in ("reply", "attachment", "context_quote") and phase == "needs_refresh":
             if action == "attachment":
                 return _attachment_failure(handle, session, "needs_refresh")
             return failure("needs_refresh", revision=session["revision"], requires_refresh=True)
         state = state_factory(base, state_dir)
+        if action == "context_quote":
+            return _context_quote(request, handle, session, state)
         if action == "attachment":
             return _dispatch_attachment(request, directory, handle, session, state, base)
         if action == "refresh":
@@ -964,6 +1489,7 @@ def _dispatch(request, base, state_dir, state_factory):
                 _save(directory, handle, session)
                 return failure("lease_lost")
             fields = _snapshot(session, batch)
+            fields.update(_context_read(state, batch, session))
             session["phase"] = "active"
             session["call_timings"]["refresh"]["result"] = "ok"
             _save(directory, handle, session)
@@ -990,11 +1516,21 @@ def _dispatch(request, base, state_dir, state_factory):
             "started_at": None, "returned_at": None, "result": "outcome_unknown"}
         _save(directory, handle, session)
         try:
-            result = _invoke_timed(session, "reply", state.reply, session["owned"],
-                                   request.get("text", ""), session["lease"],
-                                   request.get("media_path"))
+            wrapped = None
+            method = _context_terminal(session, state, request, "reply_with_context")
+            if method is None:
+                result = _invoke_timed(session, "reply", state.reply, session["owned"],
+                                       request.get("text", ""), session["lease"],
+                                       request.get("media_path"))
+            else:
+                wrapped = _invoke_timed(session, "reply", method, session["owned"],
+                                        request.get("text", ""), session["lease"],
+                                        request.get("media_path"), handle=handle,
+                                        revision=session["revision"], basis=session.get("context_basis"))
+                result = wrapped.result
             if result.get("error") == "needs_refresh":
                 fields = _snapshot(session, result)
+                fields.update(_context_read(state, result, session))
                 session["phase"] = "needs_refresh"
                 session["call_timings"]["reply"]["result"] = "needs_refresh"
                 _save(directory, handle, session)
@@ -1005,6 +1541,7 @@ def _dispatch(request, base, state_dir, state_factory):
             session["phase"] = "queued"
             session["call_timings"]["reply"]["result"] = "queued"
             _save(directory, handle, session)
+            _context_commit(state, wrapped, request)
             return dict(ok=True, handle=handle, revision=session["revision"],
                         queued=result["queued"], owned_count=len(session["owned"]),
                         delivery_confirmed=False)
@@ -1021,13 +1558,15 @@ def _dispatch(request, base, state_dir, state_factory):
             return _uncertain(directory, handle, session)
 
 
-def handle_request(request, base, state_dir, state_factory=None):
+def handle_request(request, base, state_dir, state_factory=None, cloud_binding=None):
     try:
         validate_request(request)
         if WorkerState is None or safe_message_id is None:
             return failure("invalid_configuration")
+        if cloud_binding is not None and cloud_binding != SYNTHETIC_CLOUD_BINDING:
+            return failure("invalid_configuration")
         base, state_dir = _trusted_paths(base, state_dir)
-        return _dispatch(request, base, state_dir, state_factory or WorkerState)
+        return _dispatch(request, base, state_dir, state_factory or WorkerState, cloud_binding)
     except InvalidRequest:
         return failure("invalid_request")
     except SessionError as error:
@@ -1045,10 +1584,30 @@ def main(argv=None):
     parser = QuietParser(description=__doc__)
     parser.add_argument("--base", required=True)
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--cloud-source-id")
+    parser.add_argument("--cloud-case-id")
+    parser.add_argument("--cloud-publisher-id")
+    parser.add_argument("--runtime-environment", action="store_true",
+                        help="read the private four-switch launch configuration without a worker action")
     try:
         args = parser.parse_args(argv)
-        request = parse_request(sys.stdin)
-        result = handle_request(request, args.base, args.state_dir)
+        base, state_dir = _trusted_paths(args.base, args.state_dir)
+        environment = _runtime_environment(state_dir)
+        if args.runtime_environment:
+            print(json.dumps({"schema_version": 1, "configured": environment is not None,
+                              "environment": environment or {}}, separators=(",", ":")))
+            return 0
+        binding = {"source_id": args.cloud_source_id, "case_id": args.cloud_case_id,
+                   "publisher_id": args.cloud_publisher_id}
+        if all(value is None for value in binding.values()):
+            binding = None
+        elif binding != SYNTHETIC_CLOUD_BINDING:
+            raise InvalidRequest()
+        with _runtime_switches(environment or {}):
+            request = parse_request(sys.stdin)
+            result = handle_request(request, base, state_dir, cloud_binding=binding)
+    except SessionError:
+        result = failure("invalid_configuration")
     except (InvalidRequest, UnicodeError):
         result = failure("invalid_request")
     except Exception:

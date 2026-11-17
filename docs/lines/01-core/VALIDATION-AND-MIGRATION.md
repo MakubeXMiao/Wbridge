@@ -59,7 +59,7 @@ M2 是未来候选步骤，不是本轮启动重构的许可。候选的阶段�
 | V17 超时/副作用 | 工具阻塞超过 lease、平台先杀 worker、结果丢失、旧任务仍活；核对旧 run 后才恢复；无核对能力时保留 unknown | 旧租约 tests + 新后端故障矩阵，待补 |
 | V18 迁移/回退 | 旧输入/账本不丢；新字段 version 和旧可读性验证；锁顺序无反转；代码回退不回滚运行状态 | 先冻结 schema/兼容路径，再补 migration fixtures |
 | V19 阶段追踪 | 同一消息收件→wake→adopt→enqueue→send→API；后端 run/session/attempt 可关联；正文/秘密不入日志 | `test_latency_trace.py`；新增事件标识待补 |
-| V20 实机 | 对应真实 SHA/dirty/解释器/包/脚本/prompt；B1–B8、五连发首回、媒体、重启；手机可见结果单列 | 平台现场取证与[当前验收范围](../../PUBLIC-UPDATE-20261029.md)；离线测试不代做 |
+| V20 实机 | 对应真实 SHA/dirty/解释器/包/脚本/prompt；B1–B8、五连发首回、媒体、重启；手机可见结果单列 | 02 取证与 `docs/MUSE-TESTING.md`；本轮不代做 |
 | V21 多实例与日志 | 同 bot 跨 base 启动冲突可见；监督不跨实例误停；合成 URL/query/token 异常不出现在媒体等下层日志 | 当前单 Store 锁/命令识别不能保证全局互斥；`media.py:79` 错误路径需补日志回归 |
 
 现有统一离线入口为 `tests/run_offline.py`，分进程阻断真实 Python socket 并隔离状态；Shell 子套件是部分 Python 场景的包装，不重复累计覆盖。后续获准执行时使用独立 venv/base；macOS 系统 Python 可设置 `PYTHONDONTWRITEBYTECODE=1` 排除字节码缓存对 dry-run 路径检查的影响。该环境处理不能替代代码/平台验收。

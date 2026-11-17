@@ -2,13 +2,13 @@
 
 该桥接程序使用 iLink 接收消息，保存 inbox，由 Muse worker 处理并入队，独立 flusher 发送回复。云主机的真实安装、平台唤醒与微信送达须由所有者验收，仓库测试不等同于实机通过。
 
-依赖由 `pyproject.toml` 声明：`qrcode[pil]`、`pycryptodome`、`Pillow>=9.1.0`。只改 GitHub 不会自动更新云主机。
+依赖由 `pyproject.toml` 声明：`qrcode[pil]`、`pycryptodome`。只改 GitHub 不会自动更新云主机。
 
 ## 本分支的协议入口
 
 Worker 和 Hook 使用 [`hooks/WORKER-STATE.md`](../hooks/WORKER-STATE.md) 中的机器状态接口。不得再直接追加 claimed/seen/started 或手写 outbox 来绕过 lease。`files` 与 `rewoken_files` 必须合并处理，真实处理集合由 helper 返回的所有权决定。
 
-部署与验收按 [当前更新与部署说明](PUBLIC-UPDATE-20261029.md)及[Hook 目标保全检查](lines/02-muse/MUSE-ATTACHMENT-003-DEPLOYMENT.md)。Python 包、Hook 脚本和 prompt 要同步更新；仓库定义中的 delivery.to 是占位符，保留线上真实投递目标。
+部署与验收按 [Muse 拉取测试说明](MUSE-TESTING.md)。Python 包、Hook 脚本和 prompt 要同步更新；仓库定义中的 delivery.to 是占位符，保留线上真实投递目标。
 
 ## 数据与服务
 

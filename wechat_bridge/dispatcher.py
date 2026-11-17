@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 
 from .backend_state import BackendState, digest, encode
+from .backends.contract import BackendError
+from .pepe_core import prepare_pepe_request, require_pepe_dispatch_policy, validate_pepe_input
 from .store import atomic_write_json, load_json, log, message_receipt_lock, safe_message_id
 
 TERMINAL = {"succeeded", "failed", "cancelled", "abandoned"}
@@ -262,23 +264,36 @@ class Dispatcher:
             job = json.loads(row[0])
             session = db.execute("SELECT session_id FROM sessions WHERE key=?", (job["conversation_key"],)).fetchone()
             job.update(status="running", started_at=self.clock(), deadline_at=self.clock() + self.config.get("job_timeout_seconds", 1800),
-                       session_id=session[0] if session else None)
+                       session_id=session[0] if session and job["backend_id"] != "pepe" else None)
             self.state.put_job(db, job)
         selected = self.config["backends"][job["backend_id"]]
         request = {key: job[key] for key in ("execution_id", "attempt_id", "account_scope", "sender_key",
                    "backend_id", "backend_instance_ref", "conversation_key", "session_id", "deadline_at")}
-        request.update(schema_version=1, cwd=selected["cwd"], execution_policy=selected.get("execution_policy", {"approval": "explicit"}))
-        request["messages"] = []
-        for record in job["records"]:
-            attachments = []
-            for path in record.get("media_paths", []):
-                if os.path.isfile(path):
-                    attachments.append({"path": os.path.realpath(path), "status": "available"})
-                else:
-                    attachments.append({"status": "failed", "count": 1})
-            if record.get("media_failed_count"):
-                attachments.append({"status": "failed", "count": record["media_failed_count"]})
-            request["messages"].append({"message_id": str(record["message_id"]), "text": record.get("text", ""), "attachments": attachments})
+        request["schema_version"] = 1
+        if job["backend_id"] == "pepe":
+            try:
+                validate_pepe_input(job)
+                require_pepe_dispatch_policy(selected)
+                request.update(prepare_pepe_request(self.state, job, selected, self.clock(), clock=self.clock))
+            except BackendError as exc:
+                self._reject_unstarted(job["execution_id"], str(exc))
+                return
+            except Exception:
+                self._unknown(job["execution_id"], "remote_task_prepare_unknown")
+                return
+        else:
+            request.update(cwd=selected["cwd"], execution_policy=selected.get("execution_policy", {"approval": "explicit"}))
+            request["messages"] = []
+            for record in job["records"]:
+                attachments = []
+                for path in record.get("media_paths", []):
+                    if os.path.isfile(path):
+                        attachments.append({"path": os.path.realpath(path), "status": "available"})
+                    else:
+                        attachments.append({"status": "failed", "count": 1})
+                if record.get("media_failed_count"):
+                    attachments.append({"status": "failed", "count": record["media_failed_count"]})
+                request["messages"].append({"message_id": str(record["message_id"]), "text": record.get("text", ""), "attachments": attachments})
         try:
             if self.factory is None:
                 from .backends.registry import create_backend
@@ -289,6 +304,42 @@ class Dispatcher:
             driver.start(request)
         except Exception:
             self._unknown(job["execution_id"], "backend_start_unknown")
+
+    def _reject_unstarted(self, job_id, reason):
+        # Only before driver construction; no remote work can have been sent.
+        with self.state.transaction() as db:
+            job = self.state.get_job(db, job_id)
+            if not job or job["status"] != "running":
+                return
+            job.update(status="failed", side_effect_state="none", error_code=reason,
+                       updated_at=self.clock())
+            self.state.put_job(db, job)
+            self._output(db, "terminal:" + job_id, job["records"][-1],
+                         "任务 %s 未启动（%s）。" % (job_id, reason), "error", job)
+
+    def _pepe_event(self, db, job, event):
+        if event.get("session_id") is not None or event["type"] == "approval_requested":
+            raise ValueError("PEPE does not support sessions or approval interaction")
+        row = db.execute("SELECT payload FROM remote_tasks WHERE execution_id=?",
+                         (job["execution_id"],)).fetchone()
+        remote = json.loads(row[0]) if row else None
+        if (not remote or remote.get("execution_id") != job["execution_id"]
+                or remote.get("attempt_id") != job["attempt_id"]
+                or remote.get("backend_instance_ref") != job["backend_instance_ref"]):
+            raise ValueError("PEPE journal execution mismatch")
+        kind = event["type"]
+        if kind in ("started", "progress", "final"):
+            if (remote["state"] != "bound" or not remote["task_id"]
+                    or event.get("remote_task_id") != remote["task_id"]):
+                raise ValueError("PEPE event task mismatch")
+        elif event.get("remote_task_id") is not None and event["remote_task_id"] != remote["task_id"]:
+            raise ValueError("PEPE event task mismatch")
+        if kind in ("failed", "cancelled") and (
+                remote["state"] != "prepared" or event.get("side_effect_state") != "none"):
+            # A remote terminal state is not proof that PEPE stopped executing.
+            event = dict(event, type="unknown", side_effect_state="unknown",
+                         error_code="remote_stop_unconfirmed")
+        return event
 
     def _mark_cancelling(self, db, job, reason):
         if job["status"] != "cancelling":
@@ -338,6 +389,8 @@ class Dispatcher:
                 return
             from .backends.contract import validate_event
             event = validate_event(event, job_id, job["attempt_id"])
+            if job["backend_id"] == "pepe":
+                event = self._pepe_event(db, job, event)
             event_id = event.get("event_id")
             if not isinstance(event_id, str) or not event_id or len(event_id) > 256:
                 raise ValueError("invalid event id")

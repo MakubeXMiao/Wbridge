@@ -37,6 +37,13 @@ class BackendState:
                 CREATE TABLE IF NOT EXISTS routes (sender TEXT PRIMARY KEY, backend TEXT NOT NULL,
                     revision INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS remote_tasks (execution_id TEXT PRIMARY KEY,
+                    scope_id TEXT NOT NULL, request_key TEXT NOT NULL, task_id TEXT,
+                    identity TEXT NOT NULL, payload TEXT NOT NULL);
+                CREATE UNIQUE INDEX IF NOT EXISTS remote_tasks_scope_request
+                    ON remote_tasks(scope_id, request_key);
+                CREATE UNIQUE INDEX IF NOT EXISTS remote_tasks_scope_task
+                    ON remote_tasks(scope_id, task_id) WHERE task_id IS NOT NULL;
             ''')
             row = connection.execute("SELECT value FROM metadata WHERE key='binding'").fetchone()
             if row and json.loads(row[0]) != self.binding:

@@ -44,6 +44,8 @@ MAX_EVENT_ITEMS = 1024
 ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 KEY_RE = re.compile(r"[0-9a-f]{32}(?:\.(?:bin|jpg|png|gif|webp|bmp|mp4|mov|pdf|heic|heif))?\Z")
 REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+REFERENCE_KINDS = frozenset(("image", "file"))
+VERIFIED_RASTERS = frozenset(("jpeg", "png", "gif", "webp"))
 SCHEMA = {
     "metadata": (("key", "TEXT"), ("value", "TEXT")),
     "events": (("seq", "INTEGER"), ("event_key", "TEXT"), ("scope", "TEXT"), ("payload", "TEXT")),
@@ -192,6 +194,78 @@ def _merge_publication_tags(existing, incoming):
     return result
 
 
+def _reference_digest(value):
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _reference_v2_state(event, seq):
+    """Validate the additive event extension without interpreting old rows."""
+    if type(event) is not dict:
+        raise AttachmentError("storage_invalid")
+    if "reference_v2" not in event:
+        return None
+    state = event["reference_v2"]
+    try:
+        if (type(state) is not dict or set(state) != {"schema_version", "login_epoch", "group", "snapshot_id", "generation"}
+                or type(state["schema_version"]) is not int or state["schema_version"] != 2
+                or type(event["seq"]) is not int or event["seq"] != seq or seq < 1):
+            raise ValueError()
+        _text(state["login_epoch"])
+        if state["generation"] is not None:
+            _id(state["generation"])
+        _text(event["message_id"])
+        at = _number(event["received_at"])
+        aids = event["attachment_ids"]
+        if type(aids) is not list or len(aids) > MAX_EVENT_ITEMS:
+            raise ValueError()
+        if len({_id(aid) for aid in aids}) != len(aids):
+            raise ValueError()
+        if state["snapshot_id"] is not None:
+            _id(state["snapshot_id"])
+        group = state["group"]
+        if group is None:
+            if aids or state["snapshot_id"] is not None:
+                raise ValueError()
+            return state
+        if (type(group) is not dict or set(group) != {"group_id", "first_event_seq", "last_member_seq",
+                "expires_at", "position_limit", "closed", "member_chain"}):
+            raise ValueError()
+        _id(group["group_id"])
+        first, last = group["first_event_seq"], group["last_member_seq"]
+        if (type(first) is not int or type(last) is not int or not 1 <= first <= last <= seq
+                or bool(aids) != (last == seq)
+                or type(group["position_limit"]) is not int or not 1 <= group["position_limit"] <= 16
+                or type(group["closed"]) is not bool
+                or type(group["member_chain"]) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", group["member_chain"])
+                or at >= _number(group["expires_at"])
+                or state["snapshot_id"] is not None and not group["closed"]):
+            raise ValueError()
+    except (AttachmentError, ValueError, KeyError, TypeError):
+        raise AttachmentError("storage_invalid") from None
+    return state
+
+
+def _reference_v2_group_identity(group):
+    return [group[key] for key in ("group_id", "first_event_seq", "expires_at", "position_limit")]
+
+
+def _reference_v2_append(chain, event, items):
+    return _reference_digest([chain, event["seq"], event["message_id"], event["received_at"], items])
+
+
+def _photo_state(record):
+    # Published content evidence survives loss of the corresponding object.
+    if record["status"] in ("ready", "missing"):
+        detected = (record["detected_type"] or "").lower()
+        if (detected in VERIFIED_RASTERS and record["preview_state"] == "readable"
+                and record["decryption_state"] in ("content_verified", "plaintext_verified")):
+            return "confirmed_photo"
+        if detected == "text/plain":
+            return "not_photo"
+    return "unverified"
+
+
 class AttachmentStore:
     def __init__(self, base, policy=None, clock=time.time, fault=None):
         raw = os.fspath(base)
@@ -287,7 +361,7 @@ class AttachmentStore:
                                     raise AttachmentError("storage_invalid")
                                 if row[key]:
                                     return True
-                        if row.get("reference_context") is not None:
+                        if any(row.get(key) is not None for key in ("reference_context", "reference_context_v2")):
                             return True
             finally:
                 os.close(directory)
@@ -738,7 +812,7 @@ CREATE TABLE holds(id TEXT PRIMARY KEY,attachment_id TEXT NOT NULL,scope TEXT NO
             slot["status"] = self._observed_status(dirs, rec)
         return result
 
-    def _event_result(self, db, dirs, event, scope):
+    def _event_result(self, db, dirs, event, scope, seq):
         refs = []
         for aid in event["attachment_ids"]:
             rec = self._record(db, aid, scope)
@@ -750,12 +824,192 @@ CREATE TABLE holds(id TEXT PRIMARY KEY,attachment_id TEXT NOT NULL,scope TEXT NO
             if not row:
                 raise AttachmentError("storage_invalid")
             context = self._context(db, dirs, _parse(row[0]), scope)
-        return {"schema_version": 1, "attachment_refs": refs, "reference_context": context}
+        result = {"schema_version": 1, "attachment_refs": refs, "reference_context": context}
+        state = _reference_v2_state(event, seq)
+        if state is not None:
+            if state["login_epoch"] != scope["login_epoch"]:
+                raise AttachmentError("epoch_mismatch")
+            result["reference_context_v2"] = (self._reference_v2_context(db, dirs, scope, event, state)
+                                              if state["snapshot_id"] is not None else None)
+        return result
 
-    def register_event(self, scope, message_id, items, text="", received_at=None):
+    def _register_reference_v2(self, db, scope, event, items, has_text, generation):
+        seq, at = event["seq"], event["received_at"]
+        previous = db.execute("SELECT seq,payload FROM events WHERE scope=? AND seq<? ORDER BY seq DESC LIMIT 1",
+                              (_scope_key(scope), seq)).fetchone()
+        state = _reference_v2_state(_parse(previous[1]), previous[0]) if previous else None
+        group = (state["group"] if state and state["login_epoch"] == scope["login_epoch"]
+                 and state["generation"] == generation else None)
+        if group and at >= group["expires_at"]:
+            group = None
+        if items:
+            if group is None or group["closed"]:
+                group = {"group_id": uuid.uuid4().hex, "first_event_seq": seq, "last_member_seq": seq,
+                         "expires_at": at + self.policy["recent_seconds"], "closed": False,
+                         "position_limit": self.policy["max_positions"]}
+                group["member_chain"] = _reference_digest([2, _epoch_key(scope),
+                                                          _reference_v2_group_identity(group)])
+            members = [[item["item_index"], aid, item["kind"]]
+                       for item, aid in zip(items, event["attachment_ids"])]
+            group["member_chain"] = _reference_v2_append(group["member_chain"], event, members)
+            group["last_member_seq"] = seq
+        snapshot_id = None
+        if group is not None and has_text:
+            group["closed"] = True
+            snapshot_id = uuid.uuid4().hex
+        event["reference_v2"] = {"schema_version": 2, "login_epoch": scope["login_epoch"],
+                                 "group": group, "snapshot_id": snapshot_id, "generation": generation}
+
+    def _reference_v2_members(self, db, scope, group):
+        """Rebuild the frozen range from same-scope rows and verify its chain."""
+        identity = _reference_v2_group_identity(group)
+        first, last = group["first_event_seq"], group["last_member_seq"]
+        chain = _reference_digest([2, _epoch_key(scope), identity])
+        members, last_seen = [], None
+        rows = db.execute("SELECT seq,payload FROM events WHERE scope=? AND seq BETWEEN ? AND ? ORDER BY seq",
+                          (_scope_key(scope), first, last))
+        for count, (seq, raw) in enumerate(rows, 1):
+            if count > MAX_RECORDS:
+                raise AttachmentError("storage_invalid")
+            event = _parse(raw)
+            state = _reference_v2_state(event, seq)
+            if (not state or state["login_epoch"] != scope["login_epoch"] or state["group"] is None
+                    or _reference_v2_group_identity(state["group"]) != identity
+                    or state["group"]["closed"] and seq != last):
+                raise AttachmentError("storage_invalid")
+            records = list(db.execute("SELECT id,item_index,scope FROM attachments WHERE event_seq=? ORDER BY item_index",
+                                      (seq,)))
+            if ([row[0] for row in records] != event["attachment_ids"]
+                    or len(members) + len(records) > MAX_RECORDS
+                    or not records and seq in (first, last)):
+                raise AttachmentError("storage_invalid")
+            chunk = []
+            for aid, index, row_scope in records:
+                if row_scope != _scope_key(scope):
+                    raise AttachmentError("storage_invalid")
+                record = self._record(db, aid, scope)
+                if (record["received_epoch"] != scope["login_epoch"] or record["item_index"] != index
+                        or record["message_id"] != event["message_id"]
+                        or record["received_at"] != event["received_at"]):
+                    raise AttachmentError("storage_invalid")
+                chunk.append([index, aid, record["kind"]])
+                members.append((seq, record))
+            if chunk:
+                chain = _reference_v2_append(chain, event, chunk)
+                last_seen = seq
+            if state["group"]["last_member_seq"] != last_seen or state["group"]["member_chain"] != chain:
+                raise AttachmentError("storage_invalid")
+        if not members or members[0][0] != first or last_seen != last or chain != group["member_chain"]:
+            raise AttachmentError("storage_invalid")
+        return members
+
+    def _reference_v2_context(self, db, dirs, scope, event, state):
+        group = state["group"]
+        members = self._reference_v2_members(db, scope, group)
+
+        def slot(ordinal, seq, record, photo_state):
+            return dict(ordinal=ordinal, event_seq=seq, photo_state=photo_state,
+                        status=self._observed_status(dirs, record), **{key: record[key] for key in
+                        ("message_id", "item_index", "attachment_id", "received_at", "kind")})
+
+        slots, latest = [], None
+        candidates = confirmed = 0
+        for seq, record in members:
+            if record["kind"] not in REFERENCE_KINDS:
+                continue
+            candidates += 1
+            photo_state = _photo_state(record)
+            confirmed += photo_state == "confirmed_photo"
+            if candidates <= group["position_limit"]:
+                slots.append(slot(candidates, seq, record, photo_state))
+            if photo_state != "not_photo":
+                latest = (candidates, seq, record, photo_state)
+        latest_candidate = None
+        if latest is not None:
+            latest_candidate = slots[latest[0] - 1] if latest[0] <= len(slots) else slot(*latest)
+        context = {key: group[key] for key in ("group_id", "first_event_seq", "last_member_seq",
+                                                "expires_at", "position_limit")}
+        context.update(schema_version=2, snapshot_id=state["snapshot_id"], text_message_id=event["message_id"],
+                       cutoff_seq=event["seq"], login_epoch=scope["login_epoch"], created_at=event["received_at"],
+                       attachment_count=len(members), candidate_position_count=candidates)
+        context["membership_digest"] = _reference_digest([_epoch_key(scope), context, group["member_chain"]])
+        context.update(confirmed_photo_count=confirmed, overflow=candidates > len(slots),
+                       slots=slots, latest_candidate=latest_candidate)
+        return context
+
+    def context_sources(self, scope, owned_records):
+        """Read existing event order for an already-owned, current-epoch batch.
+
+        This is an internal provenance lookup, not another receive operation.
+        An event's scope key predates login epochs, so its trusted receive time
+        must also match the current owned inbox record.  Missing provenance is
+        deliberately unavailable rather than repaired by writing a new event.
+        """
+        scope = _scope(scope)
+        if type(owned_records) is not list or not 1 <= len(owned_records) <= 1000:
+            raise AttachmentError("sequence_unavailable")
+        wanted = []
+        seen = set()
+        for record in owned_records:
+            if (type(record) is not dict
+                    or record.get("login_epoch") != scope["login_epoch"]
+                    or record.get("from_user_id") != scope["owner_id"]):
+                raise AttachmentError("sequence_unavailable")
+            try:
+                mid = _text(record.get("message_id"))
+                at = _number(record.get("received_at"))
+            except AttachmentError:
+                raise AttachmentError("sequence_unavailable") from None
+            if mid in seen:
+                raise AttachmentError("sequence_unavailable")
+            seen.add(mid)
+            wanted.append((mid, at))
+        scope_key = _scope_key(scope)
+        sources = []
+        with self._db(False, initialize=False) as (db, _dirs):
+            if db is None:
+                raise AttachmentError("sequence_unavailable")
+            for mid, at in wanted:
+                key = hashlib.sha256(_json([scope_key, mid]).encode()).hexdigest()
+                row = db.execute("SELECT seq,scope,payload FROM events WHERE scope=? AND event_key=?",
+                                 (scope_key, key)).fetchone()
+                if row is None:
+                    raise AttachmentError("sequence_unavailable")
+                seq, stored_scope, raw = row
+                event = _parse(raw)
+                if (type(seq) is not int or seq < 1 or stored_scope != scope_key
+                        or type(event) is not dict
+                        or type(event.get("schema_version")) is not int
+                        or event["schema_version"] != 1
+                        or type(event.get("seq")) is not int or event["seq"] != seq
+                        or event.get("message_id") != mid
+                        or type(event.get("fingerprint")) is not str
+                        or not re.fullmatch(r"[0-9a-f]{64}", event["fingerprint"])):
+                    raise AttachmentError("sequence_unavailable")
+                try:
+                    event_at = _number(event.get("received_at"))
+                except AttachmentError:
+                    raise AttachmentError("sequence_unavailable") from None
+                if event_at != at:
+                    raise AttachmentError("sequence_unavailable")
+                state = _reference_v2_state(event, seq)
+                if state is not None and state["login_epoch"] != scope["login_epoch"]:
+                    raise AttachmentError("sequence_unavailable")
+                sources.append({"message_id": mid, "seq": seq, "received_at": event_at,
+                                "fingerprint": event["fingerprint"]})
+        sources.sort(key=lambda source: source["seq"])
+        if len({source["seq"] for source in sources}) != len(sources):
+            raise AttachmentError("sequence_unavailable")
+        return sources
+
+    def register_event(self, scope, message_id, items, text="", received_at=None, *,
+                       reference_v2=False, reference_generation=None):
         scope, message_id = _scope(scope), _text(message_id)
-        if type(items) is not list or len(items) > MAX_EVENT_ITEMS or type(text) is not str:
+        if (type(items) is not list or len(items) > MAX_EVENT_ITEMS or type(text) is not str
+                or type(reference_v2) is not bool or not reference_v2 and reference_generation is not None):
             raise AttachmentError("invalid_request")
+        if reference_generation is not None:
+            _id(reference_generation)
         normalized, indices = [], set()
         for item in items:
             if type(item) is not dict or set(item) != {"item_index", "kind", "original_name", "declared_type"}:
@@ -774,16 +1028,22 @@ CREATE TABLE holds(id TEXT PRIMARY KEY,attachment_id TEXT NOT NULL,scope TEXT NO
         fingerprint = hashlib.sha256(_json([normalized, text]).encode()).hexdigest()
         key = hashlib.sha256(_json([_scope_key(scope), message_id]).encode()).hexdigest()
         with self._db(True) as (db, dirs):
-            previous = db.execute("SELECT payload FROM events WHERE event_key=?", (key,)).fetchone()
+            previous = db.execute("SELECT seq,payload FROM events WHERE event_key=?", (key,)).fetchone()
             if previous:
-                event = _parse(previous[0])
+                seq, raw = previous
+                event = _parse(raw)
                 if event["fingerprint"] != fingerprint:
                     raise AttachmentError("invalid_request")
+                checked = "reference_v2" not in event
                 for aid in event["attachment_ids"]:
                     rec = self._record(db, aid, scope)
                     if rec["status"] == "prepared":
+                        if not checked:
+                            # Reject bad frozen metadata before repairing an object.
+                            self._event_result(db, dirs, event, scope, seq)
+                            checked = True
                         self._finish_prepared(db, dirs, rec)
-                return self._event_result(db, dirs, event, scope)
+                return self._event_result(db, dirs, event, scope, seq)
             count = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
             if count + len(normalized) > MAX_RECORDS or db.execute("SELECT count(*) FROM events").fetchone()[0] >= MAX_RECORDS:
                 raise AttachmentError("quota_exceeded")
@@ -839,9 +1099,12 @@ CREATE TABLE holds(id TEXT PRIMARY KEY,attachment_id TEXT NOT NULL,scope TEXT NO
                         overflow=group["total_positions"] > len(group["slots"]), total_positions=group["total_positions"])
                     db.execute("INSERT INTO snapshots VALUES (?,?,?)", (sid, _epoch_key(scope), _json(snapshot)))
                     event["snapshot_id"] = sid
+            if reference_v2:
+                self._register_reference_v2(
+                    db, scope, event, normalized, bool(text.strip()), reference_generation)
             db.execute("UPDATE events SET payload=? WHERE seq=?", (_json(event), seq))
             self._fault("register_before_commit")
-            return self._event_result(db, dirs, event, scope)
+            return self._event_result(db, dirs, event, scope, seq)
 
     @staticmethod
     def _object_key(attachment_id, detected_type):
@@ -1274,6 +1537,92 @@ CREATE TABLE holds(id TEXT PRIMARY KEY,attachment_id TEXT NOT NULL,scope TEXT NO
             return {"schema_version": 1, "reference_context": context, "materials": materials,
                     "unavailable": unavailable, "complete": not unavailable}
 
+    def resolve_reference_v2(self, scope, text_message_id, snapshot_id, ordinals=None, holder=None):
+        scope, mid, snapshot_id = _scope(scope), _text(text_message_id), _id(snapshot_id)
+        if ordinals is not None and (type(ordinals) is not list or not ordinals or len(ordinals) > 16
+                or any(type(i) is not int or not 1 <= i <= 16 for i in ordinals) or len(set(ordinals)) != len(ordinals)):
+            raise AttachmentError("invalid_request")
+        if holder is not None:
+            holder = _text(holder)
+        with self._db(holder is not None) as (db, dirs):
+            key = _reference_digest([_scope_key(scope), mid])
+            row = db.execute("SELECT seq,scope,payload FROM events WHERE event_key=?", (key,)).fetchone() if db else None
+            if not row:
+                raise AttachmentError("not_found")
+            seq, row_scope, raw = row
+            event = _parse(raw)
+            state = _reference_v2_state(event, seq)
+            if not state or state["snapshot_id"] != snapshot_id:
+                raise AttachmentError("not_found")
+            if row_scope != _scope_key(scope) or event["message_id"] != mid:
+                raise AttachmentError("storage_invalid")
+            if state["login_epoch"] != scope["login_epoch"]:
+                raise AttachmentError("epoch_mismatch")
+            now = self._now()
+            if now >= state["group"]["expires_at"]:
+                raise AttachmentError("snapshot_expired")
+            context = self._reference_v2_context(db, dirs, scope, event, state)
+            slots = context["slots"]
+            if ordinals is not None and any(i > len(slots) for i in ordinals):
+                raise AttachmentError("not_found")
+            selected = slots if ordinals is None else [slots[i - 1] for i in ordinals]
+            materials, unavailable = [], []
+            for slot in selected:
+                if slot["photo_state"] == "confirmed_photo" and slot["status"] == "ready":
+                    if holder is None:
+                        continue
+                    try:
+                        acquired = self._acquire(db, dirs, scope, slot["attachment_id"], holder, 1800, now)
+                    except AttachmentError as error:
+                        if error.code != "attachment_unavailable":
+                            raise
+                        slot["status"] = "missing"
+                    else:
+                        meta = acquired["metadata"]
+                        materials.append(dict(ordinal=slot["ordinal"], attachment_id=slot["attachment_id"],
+                            path=acquired["path"], hold_id=acquired["hold_id"], expires_at=acquired["expires_at"],
+                            preview_state=meta["preview_state"], detected_type=meta["detected_type"],
+                            size=meta["size"], sha256=meta["sha256"]))
+                        continue
+                unavailable.append({key: slot[key] for key in ("ordinal", "attachment_id", "status", "photo_state")})
+            return {"reference_context_v2": context, "materials": materials, "unavailable": unavailable,
+                    "complete": not unavailable}
+
+    def _reference_v2_protected(self, db, now):
+        """Validate extensions and collect each live membership range once."""
+        latest, groups = {}, {}
+
+        def protect(entry):
+            scope_key, epoch, group = entry
+            key = (scope_key, epoch, *_reference_v2_group_identity(group),
+                   group["last_member_seq"], group["member_chain"])
+            groups[key] = entry
+
+        for count, (seq, scope_key, raw) in enumerate(db.execute("SELECT seq,scope,payload FROM events ORDER BY seq"), 1):
+            if count > MAX_RECORDS:
+                raise AttachmentError("storage_invalid")
+            state = _reference_v2_state(_parse(raw), seq)
+            group = state["group"] if state else None
+            if group and now < group["expires_at"]:
+                entry = (scope_key, state["login_epoch"], group)
+                latest[scope_key] = entry
+                if state["snapshot_id"] is not None:
+                    protect(entry)
+            else:
+                latest.pop(scope_key, None)
+        for entry in latest.values():
+            protect(entry)
+        protected = set()
+        for scope_key, epoch, group in groups.values():
+            identity = _parse(scope_key)
+            if type(identity) is not list or len(identity) != 3:
+                raise AttachmentError("storage_invalid")
+            scope = _scope(dict(zip(("bot_id", "owner_id", "conversation_id", "login_epoch"), identity + [epoch])))
+            if _scope_key(scope) != scope_key:
+                raise AttachmentError("storage_invalid")
+            protected.update(record["attachment_id"] for _, record in self._reference_v2_members(db, scope, group))
+        return protected
+
     def preview_gc(self):
         now = self._now()
         with self._db() as (db, dirs):
@@ -1298,6 +1647,7 @@ CREATE TABLE holds(id TEXT PRIMARY KEY,attachment_id TEXT NOT NULL,scope TEXT NO
                 group = self._group(db, gid)
                 if now < group["expires_at"]:
                     protected.update(slot["attachment_id"] for slot in group["slots"])
+            protected.update(self._reference_v2_protected(db, now))
             items, eligible, protected_count = [], 0, 0
             for (aid,) in db.execute("SELECT id FROM attachments ORDER BY event_seq,item_index"):
                 rec = self._record(db, aid)

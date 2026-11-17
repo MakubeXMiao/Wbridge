@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 
+from . import delivery_failures
 from .store import (Store, atomic_write_json, atomic_write_text, load_json,
                     message_receipt_lock, safe_message_id)
 from .runtime_logs import (append_supervision_event, launch_logged_service,
@@ -451,8 +452,32 @@ class WorkerState:
         from .attachment_runtime import worker_call
         return worker_call(self, ids, lease, request)
 
+    def context_for_batch(self, batch, cloud_binding=None):
+        from .context_runtime import context_for_batch
+        return context_for_batch(self, batch, cloud_binding)
+
+    def reply_with_context(self, ids, text, lease, media_path=None, *, handle,
+                           revision, basis=None):
+        from .context_runtime import reply_with_context
+        return reply_with_context(self, ids, text, lease, media_path,
+                                  handle=handle, revision=revision, basis=basis)
+
+    def attachment_call_with_context(self, ids, lease, request, *, handle,
+                                     revision, basis=None):
+        from .context_runtime import attachment_call_with_context
+        return attachment_call_with_context(self, ids, lease, request,
+                    handle=handle, revision=revision, basis=basis)
+
+    def context_commit(self, capsule, delta):
+        from .context_runtime import context_commit
+        return context_commit(self, capsule, delta)
+
+    def context_quote(self, batch, basis, entry_id, quote_index):
+        from .context_runtime import context_quote
+        return context_quote(self, batch, basis, entry_id, quote_index)
+
     def enqueue_reply(self, ids, to, context, text, lease, media_path=None,
-                      collect_batch=False):
+                      collect_batch=False, _context_capture=None):
         normalized = list(dict.fromkeys(safe_message_id(mid) for mid in ids))
         if not normalized or (not to and not collect_batch) or not isinstance(text, str):
             raise ValueError("ids, recipient and a text string required")
@@ -530,6 +555,12 @@ class WorkerState:
             registry["admitted"] = True
             registry["phase"] = "admitted"
             atomic_write_json(str(registry_path), registry)
+            if _context_capture is not None:
+                try:
+                    _context_capture(reply_scope, [records[mid] for mid in normalized],
+                        {"kind": "reply", "job_id": latest, "group_id": None}, text)
+                except Exception:
+                    pass
             self._complete(normalized, claims)
             self._trace("enqueued", normalized, job_id=latest,
                         enqueued_at=job["enqueued_at"],
@@ -604,10 +635,12 @@ class WorkerState:
     def notice_result(self, keys, accepted):
         with self.locked():
             rows = load_json(str(self.notice_path), {}) or {}
-            for key in keys:
-                if key in rows:
-                    rows[key]["last_runtime_accepted"] = bool(accepted)
-            atomic_write_json(str(self.notice_path), rows)
+            delivery_failures.record_notice_result(self.store.base, keys, accepted)
+            matching = [key for key in keys if key in rows]
+            for key in matching:
+                rows[key]["last_runtime_accepted"] = bool(accepted)
+            if matching:
+                atomic_write_json(str(self.notice_path), rows)
 
     def plan(self, serve_alive=True):
         now = int(self.clock())
@@ -615,7 +648,9 @@ class WorkerState:
             claims, seen = self._claims(), self._seen()
             rw = self._rewakes()
             notices = load_json(str(self.notice_path), {}) or {}
-            active_notices = set()
+            # Keep legacy attempts until the original dead letters can be
+            # matched, including when relogin/serve-down takes precedence.
+            active_notices = {key for key in notices if key.startswith("failed:")}
             result = {"decision": "silent", "reason": "no new wechat messages", "payload": {}}
 
             def notice(reason, keys, payload):
@@ -633,18 +668,22 @@ class WorkerState:
             elif not serve_alive:
                 result = notice("wechat_serve_down", ["serve_down"], {"reason": "serve restart failed"})
             else:
-                failed = sorted(p.name for p in Path(self.store.failed_dir).glob("*.json"))
-                failed_keys = ["failed:" + name for name in failed]
-                active_notices.update(failed_keys)
-                eligible_failed = [name for name in failed if self._notice(notices, "failed:" + name, now)]
+                try:
+                    eligible_failed, migrated = delivery_failures.plan_first_notices(
+                        self.store.base, notices, now)
+                    active_notices.difference_update(migrated)
+                except (OSError, ValueError):
+                    # Failed alert storage cannot take ownership of the inbox.
+                    print("dead_letter_review_unavailable", file=sys.stderr)
+                    eligible_failed = []
                 if eligible_failed:
                     # An alert must not consume/revoke a message lease when
                     # its message wake will not be emitted in this round.
                     notices = {key: row for key, row in notices.items() if key in active_notices}
                     atomic_write_json(str(self.notice_path), notices)
                     return {"decision": "wake", "reason": "wechat_dead_letter",
-                            "payload": {"failed_files": eligible_failed,
-                                        "notice_keys": ["failed:" + name for name in eligible_failed]}}
+                            "payload": {"failed_files": [name for name, _ in eligible_failed],
+                                        "notice_keys": [key for _, key in eligible_failed]}}
                 # Clean completed/redelivered inbox under the receiver's lock.
                 candidates = []
                 for path in sorted(Path(self.store.inbox_dir).glob("*.json")):
@@ -844,8 +883,14 @@ def _supervision_event(store, now, reason, action, result, old=None, new=None, h
         pass
 
 
-def supervise(base, executable, clock=time.time, identity=process_identity, sleep=time.sleep):
+def supervise(base, executable, clock=time.time, identity=process_identity, sleep=time.sleep,
+              cloud_binding=None):
     store = Store(base)
+    try:
+        from .context_runtime import recent_context_maintain
+        recent_context_maintain(store, clock=clock, cloud_binding=cloud_binding)
+    except Exception:
+        pass
     # Healthy old services must not bypass maintenance. Their already-open log
     # FD is copy-trimmed in place; continuous bounds begin at a controlled start
     # using the pipe relay, never by killing a healthy process just for logs.
@@ -939,6 +984,9 @@ def main(argv=None):
     parser.add_argument("--state-dir", default=os.environ.get("WECHAT_HOOK_STATE_DIR", os.path.expanduser("~/hooks/state")))
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("attachment-capabilities")
+    maintain = sub.add_parser("recent-context-maintain")
+    for field in ("source-id", "case-id", "publisher-id"):
+        maintain.add_argument("--cloud-" + field)
     attachment = sub.add_parser("attachment-call")
     attachment.add_argument("--ids", nargs="+", required=True)
     attachment.add_argument("--lease", required=True)
@@ -968,15 +1016,36 @@ def main(argv=None):
     p = sub.add_parser("notice-result")
     p.add_argument("--keys", nargs="*", default=[])
     p.add_argument("--accepted", action="store_true")
+    p = sub.add_parser("dead-letter-status", help="read private local dead-letter review metadata")
+    p.add_argument("file")
+    p = sub.add_parser("dead-letter-reconcile", help="record an explicit local maintenance decision")
+    p.add_argument("file")
+    p.add_argument("--sha256", required=True)
+    p.add_argument("--decision", required=True, choices=("received", "discarded"),
+                   help="received confirms the entire original reply, including all text chunks")
     sub.add_parser("prune-seen")
     p = sub.add_parser("recover-prepared")
     p.add_argument("job_name")
     p = sub.add_parser("supervise")
     p.add_argument("--executable", required=True)
+    for field in ("source-id", "case-id", "publisher-id"):
+        p.add_argument("--cloud-" + field)
     p = sub.add_parser("lock-run")
     p.add_argument("--lock", required=True)
     p.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    cloud_binding = None
+    if args.command in ("recent-context-maintain", "supervise"):
+        fields = (args.cloud_source_id, args.cloud_case_id, args.cloud_publisher_id)
+        if any(v is not None for v in fields):
+            if any(v is None for v in fields):
+                parser.error("all three fixed cloud binding fields are required")
+            from .cloud_context import CloudBinding
+            cloud_binding = CloudBinding(*fields)
+    if args.command == "recent-context-maintain":
+        from .context_runtime import recent_context_maintain
+        print(json.dumps(recent_context_maintain(args.base, cloud_binding=cloud_binding), ensure_ascii=False))
+        return 0
     if args.command == "attachment-capabilities":
         from .attachment_runtime import capabilities
         print(json.dumps(capabilities(args.base)))
@@ -989,7 +1058,20 @@ def main(argv=None):
             command = args.args[1:] if args.args[:1] == ["--"] else args.args
             return subprocess.call(command, env=dict(os.environ, WECHAT_HOOK_LOCKED="1"))
     if args.command == "supervise":
-        print(json.dumps(supervise(args.base, args.executable)))
+        print(json.dumps(supervise(args.base, args.executable, cloud_binding=cloud_binding)))
+        return 0
+    if args.command in ("dead-letter-status", "dead-letter-reconcile"):
+        try:
+            if args.command == "dead-letter-status":
+                result = delivery_failures.status(args.base, args.file)
+            else:
+                result = delivery_failures.reconcile(
+                    args.base, args.file, args.sha256, args.decision, time.time())
+        except OSError:
+            raise ValueError("dead_letter_storage_unavailable") from None
+        except (UnicodeError, json.JSONDecodeError):
+            raise ValueError("invalid_dead_letter_journal") from None
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     state = WorkerState(args.base, args.state_dir)
     if args.command == "attachment-call":

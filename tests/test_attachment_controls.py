@@ -156,7 +156,13 @@ class ControlTests(unittest.TestCase):
 
     def test_seventeen_received_refs_remain_seventeen_while_reference_slots_stop_at_sixteen(self):
         images = [("image", fixtures.png(), None) for _ in range(17)]
-        incoming = self.receive(self.message("synthetic-seventeen-images", attachments=images))
+        policy = runtime.effective_policy(self.base)
+        class SufficientSpace:
+            f_frsize = 1
+            f_bavail = len(images) * policy["max_bytes"] + policy["control_reserve_bytes"]
+        # This projection test requires ready inputs, not host-dependent quota.
+        with patch.object(catalog_module.os, "fstatvfs", return_value=SufficientSpace()):
+            incoming = self.receive(self.message("synthetic-seventeen-images", attachments=images))
         text = self.receive(self.message("synthetic-seventeen-question", text="上一组第16张是什么"))
         self.assertEqual(len(incoming["attachment_refs"]), 17)
         self.assertEqual([item["item_index"] for item in incoming["attachment_refs"]], list(range(17)))
@@ -172,8 +178,12 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(len(picture["attachment_refs"]), 17)
             self.assertEqual(question["reference_context"]["total_positions"], 17)
             self.assertEqual(len(question["reference_context"]["slots"]), 16)
+        self.assertEqual(context["slots"][15]["status"], "ready", context)
         selected = self.success(self.call(batch, "reference", {"text_message_id": text["message_id"],
             "snapshot_id": context["snapshot_id"], "ordinals": [16]}))
+        self.assertTrue(selected["complete"], selected)
+        self.assertEqual(selected["unavailable"], [], selected)
+        self.assertEqual(len(selected["materials"]), 1, selected)
         self.assertEqual(selected["materials"][0]["attachment_id"], incoming["attachment_refs"][15]["attachment_id"])
         self.error(self.call(batch, "reply", {"attachment_ids": [row["attachment_id"] for row in incoming["attachment_refs"]]}), "invalid_request")
 

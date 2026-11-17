@@ -304,13 +304,26 @@ class ManagedPathBatchTests(unittest.TestCase):
                 case.flush()
                 self.assertEqual((len(first_messages), len(first_bodies)), (1, 1))
                 path = Path(case.store.pending_dir) / queued["queued"]
-                job = load_json(str(path))
-                job.update(media_path=str(target), delivery_state="inflight", caption_split=True)
                 sending = Path(case.store.sending_dir) / path.name
-                atomic_write_json(str(sending), job)
-                path.unlink()
+                failed = Path(case.store.failed_dir) / path.name
+                archived = load_json(str(failed))
+                self.assertIsInstance(archived, dict)
+                self.assertEqual(archived["delivery_outcome"], "unknown")
+                self.assertFalse(path.exists())
+                self.assertFalse(sending.exists())
+                self.assertFalse((Path(case.store.sent_dir) / path.name).exists())
+                with sqlite3.connect(str(case.base / "state/attachment-delivery.sqlite3")) as db:
+                    self.assertEqual(db.execute("SELECT state FROM reservations").fetchall(), [("unknown",)])
+                case.flush()
+                self.assertEqual((len(first_messages), len(first_bodies)), (1, 1))
+                self.assertEqual(load_json(str(failed)), archived)
+
+                # Use the admitted envelope to construct old history and retain the real dead letter.
                 registry_path = case.worker.batch_dir / path.name
                 record = load_json(str(registry_path))
+                job = dict(record["job"], media_path=str(target), delivery_state="inflight",
+                           caption_split=True, attempts=archived["attempts"])
+                atomic_write_json(str(sending), job)
                 record["job"] = job
                 atomic_write_json(str(registry_path), record)
                 caption = Path(case.store.pending_dir) / (path.stem + "_caption.json")
@@ -318,7 +331,6 @@ class ManagedPathBatchTests(unittest.TestCase):
                     context_token=job["context_token"], kind="caption", login_epoch=job["login_epoch"],
                     enqueued_at=job["enqueued_at"], delivery_state="inflight", attempts=1))
                 before = publication_snapshot(case)
-                self.assertIn("unknown", str(before["ledger"]))
                 messages, bodies = case.send_spy()
                 serve._recover_sending(case.store)
                 case.flush()

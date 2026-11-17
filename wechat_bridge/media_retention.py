@@ -33,6 +33,31 @@ DB_COLUMNS = {
     "routes": (("sender", "TEXT"), ("backend", "TEXT"), ("revision", "INTEGER")),
     "sessions": (("key", "TEXT"), ("session_id", "TEXT")),
 }
+_REMOTE_DB_COLUMNS = dict(DB_COLUMNS, remote_tasks=(
+    ("execution_id", "TEXT"), ("scope_id", "TEXT"), ("request_key", "TEXT"),
+    ("task_id", "TEXT"), ("identity", "TEXT"), ("payload", "TEXT")))
+
+
+def _remote_reference_object(raw):
+    # Journal columns are JSON objects, not opaque strings or optional state.
+    # Reject hidden/invalid references rather than deleting around corruption.
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("reference_file_invalid")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError("reference_file_invalid")
+
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    if not isinstance(value, dict):
+        raise ValueError("reference_file_invalid")
+    # Also reject overflowed numbers and malformed escaped Unicode.
+    json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return value
 
 
 def _regular(fd):
@@ -437,17 +462,29 @@ class MediaRetention:
             uri = "file:%s?mode=ro&immutable=1" % urllib.parse.quote(str(database), safe="/")
             with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0.05)) as db:
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if tables != set(DB_COLUMNS) or db.execute("SELECT 1 FROM sqlite_master WHERE type IN ('view','trigger') LIMIT 1").fetchone():
+                if tables == set(DB_COLUMNS):
+                    columns_by_table = DB_COLUMNS
+                elif tables == set(_REMOTE_DB_COLUMNS):
+                    columns_by_table = _REMOTE_DB_COLUMNS
+                else:
                     raise ValueError("unknown_reference_database")
-                for table, columns in DB_COLUMNS.items():
-                    actual = tuple((row[1], row[2]) for row in db.execute('PRAGMA table_info("%s")' % table))
-                    if actual != columns:
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type IN ('view','trigger') LIMIT 1").fetchone():
+                    raise ValueError("unknown_reference_database")
+                for table, columns in columns_by_table.items():
+                    structure = db.execute('PRAGMA table_xinfo("%s")' % table).fetchall()
+                    actual = tuple((row[1], row[2]) for row in structure)
+                    if actual != columns or any(row[6] != 0 for row in structure):
                         raise ValueError("unknown_reference_database")
                     for row in db.execute('SELECT * FROM "%s"' % table):
+                        if len(row) != len(columns):
+                            raise ValueError("unknown_reference_database")
                         metadata[0] += 1
                         if metadata[0] > MAX_FILES:
                             raise ValueError("reference_budget_exceeded")
                         for (column, _), raw in zip(columns, row):
+                            remote_json = table == "remote_tasks" and column in ("identity", "payload")
+                            if remote_json and not isinstance(raw, str):
+                                raise ValueError("reference_file_invalid")
                             if raw is None:
                                 continue
                             if type(raw) is int:
@@ -457,7 +494,9 @@ class MediaRetention:
                             metadata[1] += len(raw.encode("utf-8"))
                             if metadata[1] > MAX_METADATA_BYTES:
                                 raise ValueError("reference_budget_exceeded")
-                            if column in ("payload", "record") or table == "metadata" and column == "value":
+                            if remote_json:
+                                values(_remote_reference_object(raw))
+                            elif column in ("payload", "record") or table == "metadata" and column == "value":
                                 values(json.loads(raw))
                             else:
                                 values(raw)

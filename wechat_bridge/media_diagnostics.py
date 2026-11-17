@@ -7,7 +7,7 @@ MAX_BYTES = 4096
 MAX_DOWNLOADED_BYTES = (100 << 20) + 33
 SOURCES = frozenset(("param", "full_url", "unknown"))
 REASONS = frozenset((
-    "ok", "request_or_http_error", "http_body_read_failed", "ciphertext_too_large",
+    "ok", "request_or_http_error", "http_body_read_failed", "http_body_incomplete", "ciphertext_too_large",
     "empty_body", "ciphertext_not_block_aligned", "decrypt_no_candidate",
     "decrypt_ambiguous", "plaintext_too_large", "image_invalid",
     "image_resource_limit", "image_validation_timeout", "write_failed", "unknown",
