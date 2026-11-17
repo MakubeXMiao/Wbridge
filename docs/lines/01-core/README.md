@@ -1,45 +1,19 @@
-# 01 公共底座 · 首轮边界与契约候选
+# 01 · 公共底座
 
-任务：`WBR-01-20261023-001`。日期：2026-10-23（Asia/Shanghai）。
+[回项目总览](../../00-overview/README.md) · [回仓库首页](../../../README.md)
 
-状态：**架构候选，未授权实施。** 本轮只读分析源码并新增本目录文档，不改公共业务实现、不开始多后端重构、不调整租约。跨线需求由 02/03/04 补充后，再由用户确认。
+公共底座负责微信收发、消息去重、附件收存、排队、回复状态和后端调度；由 01 维护。各助理共用这一层。
 
-## 1. 阅读入口
-
-| 文档 | 内容 |
+| 想了解或修改什么 | 入口 |
 | --- | --- |
-| [OWNER-MAP.md](OWNER-MAP.md) | 当前公共能力、文件 owner、Muse 耦合及拆分边界 |
-| [BACKEND-CONTRACT-CANDIDATE.md](BACKEND-CONTRACT-CANDIDATE.md) | 入站/附件、路由、会话、执行/结果、取消/审批、去重和恢复候选 |
-| [VALIDATION-AND-MIGRATION.md](VALIDATION-AND-MIGRATION.md) | 兼容约束、迁移/回滚、验证矩阵、待补证与待决定项 |
+| 独立安装、扫码与启动顺序 | [启动指南](QUICKSTART-V1.md) |
+| 后端接入、消息和结果规则 | [公共契约](BACKEND-CONTRACT-V1.md) |
+| 附件保存、索引与限制 | [附件箱说明](ATTACHMENT-INBOX-IMPLEMENTATION.md) |
+| 版本核对、迁移和回退 | [验证与迁移](VALIDATION-AND-MIGRATION.md) |
+| 微信接口与收发循环 | [ilink.py](../../../wechat_bridge/ilink.py) · [serve.py](../../../wechat_bridge/serve.py) |
+| 本地存储与任务调度 | [store.py](../../../wechat_bridge/store.py) · [dispatcher.py](../../../wechat_bridge/dispatcher.py) |
+| 命令行与公共测试 | [cli.py](../../../wechat_bridge/cli.py) · [tests/](../../../tests/) |
 
-## 2. 本轮证据边界
+涉及两个助理的路由、状态或附件变更，先由 00 归口，再交 01 设计；适配线不各自复制收发代码。
 
-2.1 身份：01 WeChat 公共底座；任务分支：`codex/core`；起始源码 HEAD：`fbee05a79f0638dd530b19842ecc4e57c768668f`。实际 cwd、线程 ID 与 dirty 状态见本地共享协调目录的 `registrations/01.json`，本目录仅保存脱敏分析结论。
-
-2.2 规则来自主工作区 `AGENTS.md`、`docs/DEVELOPMENT-START.md` 和最新分工文档，规则提交 `b225563680f5acfe383bba9c08bf63d16a22dfe0`。本线旧治理文档不作为最新规则来源，不自动合并规则提交。
-
-2.3 已用 Git diff 核对：本线的 `wechat_bridge/`、`hooks/`、`tests/`、`pyproject.toml`、`LICENSE` 与上游修复提交 `462337c34f70175e2ee2ddd2bd2a7b1ace402c57` 一致。原上游 `main` 为 `e1e72168ca8e1d2819df439cd3a1119aa4078eca`；这些 SHA 均不能仅凭分支名当成实机稳定性证据。
-
-2.4 接手前已有未提交的 `README.md`、`docs/COLLABORATION-DRAFT.md`、`docs/DEVELOPMENT-BASELINE.md`。本轮保留原样，不修订、不混入本任务提交。起始哈希及 dirty 清单保存在本地共享协调目录 `evidence/01/WBR-01-20261023-001-start.json`，不上传运行状态。
-
-2.5 本轮未运行业务套件或微信/Muse 服务。文中的“已有覆盖”表示已读到相应测试代码，不表示本次执行 PASS；历史离线结果也不替代当前或真实环境验收。
-
-## 3. 结论与下一步
-
-3.1 保留一套公共收件、附件处理、持久队列、发送器与消息所有权；各后端只负责自己的执行/会话适配。当前 `worker_state.py` 同时包含公共状态机与宿主监督，先维持 01 唯一 owner，不按文件中的 Muse 字样简单划走。
-
-3.2 当前没有统一后端接口、后端路由持久记录或 Agent 会话映射。`state/session.json` 是微信凭据，`context_token` 是微信发送上下文，二者都不能作为 Agent session。
-
-3.3 当前 `release` 只是释放消息租约，并不证明后端执行已经取消；没有公共审批/持久长任务协议。不能先把这些能力标为支持，再靠延长 90/570 秒期限掩盖差异。
-
-3.4 收到 02 绑定实际运行版本的实测证据后，再区分公共状态问题与 Muse 平台问题；当前不依据 09:38 摘要提出确定根因或改动租约。03/04 首轮接口要求已读取并纳入候选第 11 节，报告中的文档/证据 QA PASS 不等于真实后端能力通过；补齐 02 及未测能力/用户决定后，再冻结会话、最终结果、取消、审批和后到消息方案。
-
-本轮对外状态应记为“候选文档已交付，跨线补充/用户确认待完成”，不能记为契约已冻结、多后端已实现或平台验收通过。
-
-## 2026-10-24 首版实现
-
-本轮 WBR-01-20261024-001 已按00中的用户原始授权进入公共实现。固定接口见 [BACKEND-CONTRACT-V1.md](BACKEND-CONTRACT-V1.md)，隔离启动及权限命令见 [QUICKSTART-V1.md](QUICKSTART-V1.md)。新增持久job/审批、managed收件隔离、空闲切换、冻结输入、显式取消和异常结果保留。旧候选文档保留为设计历史，当前接口以v1为准。
-
-本线仅含公共实现和选取的b7c47be媒体补丁；Codex/CC私有driver由03/04独立交付，Muse Hook仍由02交付。没有私有driver时预检明确失败，不能用公共层离线测试宣称平台已接通。执行中重启和发送发布窗口故障会保守进入unknown，首版不自动重试或清空该状态。结果不明的恢复需操作者核对平台与队列。
-
-媒体同步下载阻塞后续文本已用假超时复现，本轮保留现有收件结构；见[媒体来源与限制](../../IMAGE-RECEIVE-FIX.md)。所有测试均用合成输入和隔离目录；真实认证生成、微信切换/审批及手机收发仍待最终集成版本人工验收。最终SHA、自测/独立QA、上传状态在共享reports/01.md固定记录。
+文档存在、离线检查通过和手机实际收到分别核对。具体版本边界以当前分支首页及 QA 记录为准。

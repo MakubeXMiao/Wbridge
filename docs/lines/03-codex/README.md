@@ -1,19 +1,29 @@
-# 03 Codex 桥
+# 03 · Codex 桥
 
-当前任务：`WBR-03-20261024-001`。首版使用 **app-server 双向协议**，提供显式会话、结果校验、一次性命令/文件修改审批与取消/超时处理，接入 01 v1 契约；当前修复按固定集成 `cad9aeec2db30d594d8fdca184360c0e8499e7e4` 的实际边界复验。
+[回项目总览](../../00-overview/README.md) · [回仓库首页](../../../README.md) · [打开 Codex 分支](https://github.com/MakubeXMiao/Wbridge/tree/wechat/codex)
 
-## 当前使用入口
+第二桥的产品名称是 Codex；当前已跑通的路线是 **PEPE／原版 dot2api 文字接入**。本机 Codex CLI 仍有独立适配代码，两种接法的会话、权限和实际验收分别记录。
 
-1. 从新私有库 `MakubeXMiao/wbridge` 选择 00 已完成集成 QA 的固定 SHA，按[公共启动指南](../01-core/QUICKSTART-V1.md)确认安装及公共 CLI。03 单支的协议测试不能替代完整集成版本。
-2. 按[独立微信账号的本机测试准备](LOCAL-TESTING.md)准备模板、扫码绑定、保存配置、预检和启动。**首次绑定前，配置模板放在运行根之外；扫码成功后才写入 `state/backends.json`。**
-3. 查看[实现、限制与验证](IMPLEMENTATION.md)与[配置模板](backends.example.json)。目标如为 OpenAI Codex Dot 的 PEPE，先完成[部署前置核对](PEPE-DEPLOYMENT-PREFLIGHT.md)，不能直接套用本机安装路径。
+## 先选要看的路线
 
-实现已有离线协议测试；候选 SHA、自测、独立 QA、上传及集成复验结果见共享协调目录 `reports/03.md`。真实模型生成、审批往返、sandbox 和微信手机收发仍须在选定主机上验收，配置预检或离线 PASS 不代表已接通。
+| 路线 | 使用说明 |
+| --- | --- |
+| 当前 PEPE／dot2api | [独立接入步骤](PEPE-QUICKSTART.md) · [配置示例](backends.pepe.example.json) · [适配机制与约束](PEPE-DOT2API.md) |
+| 本机 Codex CLI | [独立微信测试](LOCAL-TESTING.md) · [实现与限制](IMPLEMENTATION.md) · [配置示例](backends.example.json) |
 
-## 首轮历史取证（2026-10-23）
+## 当前 PEPE 文字版的边界
 
-以下文档属于已结束的 `WBR-03-20261023-001` 能力调查，保留当时版本与原型证据。其 exec 路线建议及“尚未实现”状态不适用于当前首版，不作为安装或审批接线指南。
+- 业务源 `705232a`，公开互审包为 `36807de`；2026-11-16 首轮真实微信文字收发已通，手机明确确认至少一条回复。
+- 已有 61 套公共、8 套 Muse Hook 回归和 9 项独立组合检查；这些检查不等于媒体、长期稳定或网络恢复已通过。
+- PEPE 沿用自身平台的工具权限和确认，微信桥不提供逐工具审批。
+- 每次只提交当前文字；原生任务沿用同一聊天的设置，不证明共享电脑主聊完整历史。
+- 本地取消、超时或 HTTP 资源退出不等于 PEPE 已停止；结果不明时保留原任务，不自动重投。
+- 多后端模式中，发送结果未知时的切换检查与状态展示仍有 P2，归 01 修复；开放 Muse／PEPE 单入口切换前必须处理。
 
-- [能力矩阵、版本与原型盘点](CAPABILITY-MATRIX.md)
-- [提交给 01 的最小接口要求](INTERFACE-REQUIREMENTS.md)
-- [证据索引、复现命令与未测项](EVIDENCE.md)
+具体检查与未测范围见 [本轮 QA](../../QA-CODEX-BRIDGE-20261117.md)，后续阶段见 [两桥规划](../../TWO-BRIDGES-ROADMAP.md)。
+
+## 后续工作的分工
+
+03 优先核实原任务查询、订阅恢复和连续追问的实际能力；公共恢复、状态与切换由 01 牵头，Muse 接线涉及 02。新功能方案确认后再实施。
+
+本次只整理入口，现有业务源码与已发送的互审包保持原样。
